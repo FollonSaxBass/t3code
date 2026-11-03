@@ -1,3 +1,4 @@
+import { DEFAULT_THREAD_TITLE } from "@t3tools/provider-core/server/textGenerationUtils";
 import {
   CommandId,
   DEFAULT_MODEL,
@@ -298,7 +299,7 @@ const resolveAutoBootstrapWelcomeTargets = Effect.gen(function* () {
         .launch({
           commandId: CommandId.make(yield* randomUUID),
           projectId: project.id,
-          title: "New thread",
+          title: DEFAULT_THREAD_TITLE,
           modelSelection:
             resolveProjectSettings(settings, project.id, project).settings.defaultModelSelection ??
             threadModelSelection,

@@ -503,7 +503,22 @@ export const ProviderAdapterV2Error = Schema.Union([
 ]);
 export type ProviderAdapterV2Error = typeof ProviderAdapterV2Error.Type;
 
+export type ProviderSessionLineage = {
+  readonly v: 1;
+  readonly thread: ThreadId;
+  readonly title: string | null;
+  readonly rootThread: ThreadId;
+  readonly parentThread: ThreadId | null;
+  readonly relationship: "subagent" | "fork" | null;
+  readonly parentNative: {
+    readonly driver: ProviderDriverKind;
+    readonly nativeId: string;
+    readonly kind: "claude-code" | "codex" | null;
+  } | null;
+};
+
 export interface ProviderAdapterV2OpenSessionInput {
+  readonly lineage?: ProviderSessionLineage;
   readonly threadId: ThreadId;
   readonly providerSessionId: ProviderSessionId;
   readonly modelSelection: ModelSelection;

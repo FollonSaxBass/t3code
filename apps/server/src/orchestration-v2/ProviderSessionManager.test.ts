@@ -451,10 +451,9 @@ const makeProviderAdapter = Effect.fnUntraced(function* (
     readonly mcpConfigs?: Ref.Ref<
       ReadonlyArray<McpProviderSession.McpProviderSessionConfig | undefined>
     >;
-    readonly beforeOpen?: (input: {
-      readonly providerSessionId: ProviderSessionId;
-      readonly initialProviderItemIdentityVersion?: 2;
-    }) => Effect.Effect<void>;
+    readonly beforeOpen?: (
+      input: ProviderAdapter.ProviderAdapterV2OpenSessionInput,
+    ) => Effect.Effect<void>;
     readonly hasPendingBackgroundWork?: Effect.Effect<boolean>;
     readonly hasPendingBackgroundWorkForThread?: Effect.Effect<boolean>;
     readonly backgroundTasksEndWithProcess?: boolean;
@@ -624,10 +623,9 @@ function layerTest(input: {
   readonly mcpConfigs?: Ref.Ref<
     ReadonlyArray<McpProviderSession.McpProviderSessionConfig | undefined>
   >;
-  readonly beforeOpen?: (input: {
-    readonly providerSessionId: ProviderSessionId;
-    readonly initialProviderItemIdentityVersion?: 2;
-  }) => Effect.Effect<void>;
+  readonly beforeOpen?: (
+    input: ProviderAdapter.ProviderAdapterV2OpenSessionInput,
+  ) => Effect.Effect<void>;
   readonly failReleaseEventWrites?: boolean;
   readonly flakyReleaseWrites?: FlakyReleaseWrites;
   readonly pauseAttachWrite?: Parameters<typeof layerPausingAttachEventSink>[0];
@@ -649,6 +647,10 @@ function layerTest(input: {
   readonly spawnBeforeOpen?: boolean;
   readonly scopeCloseReached?: Deferred.Deferred<void>;
   readonly serverSettingsLayer?: ReturnType<typeof ServerSettings.layerTest>;
+  readonly projectionStoreLayer?: Layer.Layer<
+    ProjectionStore.ProjectionStoreV2,
+    Layer.Error<typeof layerTestStores>
+  >;
   readonly projectServiceLayer?: Layer.Layer<ProjectService.ProjectService>;
   readonly installationGateLayer?: Layer.Layer<ProviderInstallationGate.ProviderInstallationGate>;
 }) {
@@ -740,7 +742,7 @@ function layerTest(input: {
           IdAllocator.layer,
           layerProviderEventIngestorTest,
           layerConfiguredMcpRegistry,
-          layerTestStores,
+          input.projectionStoreLayer ?? layerTestStores,
           input.installationGateLayer ?? ProviderInstallationGate.layer,
           ...(input.serverSettingsLayer === undefined ? [] : [input.serverSettingsLayer]),
           ...(input.projectServiceLayer === undefined ? [] : [input.projectServiceLayer]),
@@ -5537,4 +5539,319 @@ it.effect("ProviderSessionManagerV2 gives a delegated child its project's device
     });
     assert.isTrue(child?.capabilities?.has("device"));
   }),
+);
+
+it.effect.each([
+  {
+    parentDriver: "claudeAgent",
+    kind: "claude-code",
+    switched: false,
+    nativeRef: "present",
+    title: "Child task",
+  },
+  {
+    parentDriver: "codex",
+    kind: "codex",
+    switched: true,
+    nativeRef: "present",
+    title: "Switched child",
+  },
+  {
+    parentDriver: "acpRegistry",
+    kind: null,
+    switched: false,
+    nativeRef: "present",
+    title: "Registry child",
+  },
+  {
+    parentDriver: "unknown-driver",
+    kind: null,
+    switched: false,
+    nativeRef: "present",
+    title: "Other child",
+  },
+  {
+    parentDriver: "claudeAgent",
+    kind: "claude-code",
+    switched: false,
+    nativeRef: "null-ref",
+    title: "Missing reference",
+  },
+  {
+    parentDriver: "codex",
+    kind: "codex",
+    switched: false,
+    nativeRef: "null-id",
+    title: "Missing ID",
+  },
+  { parentDriver: null, kind: null, switched: false, nativeRef: "present", title: "" },
+  { parentDriver: null, kind: null, switched: false, nativeRef: "present", title: "New thread" },
+  {
+    parentDriver: "codex",
+    kind: "codex",
+    switched: false,
+    nativeRef: "present",
+    title: "Parent thread read fails",
+    parentReadFailure: "thread",
+  },
+  {
+    parentDriver: "codex",
+    kind: "codex",
+    switched: false,
+    nativeRef: "present",
+    title: "Parent context read fails",
+    parentReadFailure: "context",
+  },
+] as const)(
+  "ProviderSessionManagerV2 sends session lineage with active $parentDriver parent, $nativeRef reference and title $title",
+  (scenario) =>
+    Effect.gen(function* () {
+      const { parentDriver, kind, switched, nativeRef, title } = scenario;
+      const parentReadFailure = "parentReadFailure" in scenario ? scenario.parentReadFailure : null;
+      const state = yield* Ref.make(emptyState);
+      const captured = yield* Ref.make<
+        ProviderAdapter.ProviderAdapterV2OpenSessionInput | undefined
+      >(undefined);
+      yield* Effect.gen(function* () {
+        const eventSink = yield* EventSink.EventSinkV2;
+        const idAllocator = yield* IdAllocator.IdAllocatorV2;
+        const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+        const now = yield* DateTime.now;
+        const threadId = ThreadId.make("lineage-child");
+        const parentThreadId = ThreadId.make("lineage-parent");
+        const providerSessionId = yield* idAllocator.allocate.providerSession({
+          providerInstanceId: modelSelection.instanceId,
+          threadId,
+        });
+        const created = yield* makeThreadCreatedEvent({
+          idAllocator,
+          threadId,
+          now,
+          ...(parentDriver === null ? {} : { delegatedBy: parentThreadId }),
+        });
+        const events: Array<OrchestrationV2DomainEvent> = [];
+        if (parentDriver !== null) {
+          const parent = yield* makeThreadCreatedEvent({
+            idAllocator,
+            threadId: parentThreadId,
+            now,
+          });
+          const driver = ProviderDriverKind.make(parentDriver);
+          const active: OrchestrationV2ProviderThread = {
+            ...makeProviderThread({
+              idAllocator,
+              threadId: parentThreadId,
+              providerSessionId,
+              now,
+              nativeThreadId: "active-native",
+            }),
+            id: idAllocator.derive.providerThread({ driver, nativeThreadId: "active-native" }),
+            driver,
+            nativeThreadRef:
+              nativeRef === "null-ref"
+                ? null
+                : {
+                    driver,
+                    nativeId: nativeRef === "null-id" ? null : "active-native",
+                    strength: "strong",
+                  },
+          };
+          if (switched) {
+            const previousDriver = ProviderDriverKind.make("claudeAgent");
+            const previousInstance = ProviderInstanceId.make("claude");
+            const previous = {
+              ...makeProviderThread({
+                idAllocator,
+                threadId: parentThreadId,
+                providerSessionId,
+                now,
+                nativeThreadId: "old-native",
+              }),
+              id: idAllocator.derive.providerThread({
+                driver: previousDriver,
+                nativeThreadId: "old-native",
+              }),
+              driver: previousDriver,
+              providerInstanceId: previousInstance,
+              nativeThreadRef: {
+                driver: previousDriver,
+                nativeId: "old-native",
+                strength: "strong" as const,
+              },
+            };
+            events.push(
+              {
+                ...parent,
+                payload: {
+                  ...parent.payload,
+                  providerInstanceId: previousInstance,
+                  modelSelection: { ...modelSelection, instanceId: previousInstance },
+                  activeProviderThreadId: previous.id,
+                },
+              },
+              {
+                id: yield* idAllocator.allocate.event({ threadId: parentThreadId }),
+                type: "provider-thread.updated",
+                threadId: parentThreadId,
+                occurredAt: now,
+                payload: previous,
+              },
+            );
+          } else events.push(parent);
+          if (switched) {
+            const updatedAt = DateTime.add(now, { seconds: 1 });
+            const decoy = makeProviderThread({
+              idAllocator,
+              threadId: parentThreadId,
+              providerSessionId,
+              now: updatedAt,
+              nativeThreadId: "decoy-native",
+            });
+            events.push({
+              id: yield* idAllocator.allocate.event({ threadId: parentThreadId }),
+              type: "provider-thread.updated",
+              threadId: parentThreadId,
+              occurredAt: updatedAt,
+              payload: {
+                ...decoy,
+                id: idAllocator.derive.providerThread({ driver, nativeThreadId: "decoy-native" }),
+                driver,
+                providerInstanceId: modelSelection.instanceId,
+                nativeThreadRef: { driver, nativeId: "decoy-native", strength: "strong" },
+              },
+            });
+          }
+          events.push(
+            {
+              id: yield* idAllocator.allocate.event({ threadId: parentThreadId }),
+              type: "provider-thread.updated",
+              threadId: parentThreadId,
+              occurredAt: now,
+              payload: active,
+            },
+            {
+              id: yield* idAllocator.allocate.event({ threadId: parentThreadId }),
+              type: "thread.provider-switched",
+              threadId: parentThreadId,
+              occurredAt: now,
+              payload: { ...parent.payload, activeProviderThreadId: active.id },
+            },
+          );
+        }
+        events.push({ ...created, payload: { ...created.payload, title: title || "Untitled" } });
+        yield* eventSink.write({ events });
+        if (switched) {
+          const store = yield* ProjectionStore.ProjectionStoreV2;
+          const context = yield* store.getThreadProviderContext(
+            parentThreadId,
+            modelSelection.instanceId,
+          );
+          assert.lengthOf(context.providerThreads, 2);
+          assert.equal(context.providerThreads[0]?.id, context.thread.activeProviderThreadId);
+          assert.equal(context.providerThreads[1]?.nativeThreadRef?.nativeId, "decoy-native");
+          assert.isTrue(
+            DateTime.isGreaterThan(
+              context.providerThreads[1]!.updatedAt,
+              context.providerThreads[0]!.updatedAt,
+            ),
+          );
+        }
+        yield* manager.open({ threadId, providerSessionId, modelSelection, runtimePolicy });
+        assert.deepEqual((yield* Ref.get(captured))?.lineage, {
+          v: 1,
+          thread: threadId,
+          title: title === "New thread" ? null : title || null,
+          rootThread: parentDriver === null ? threadId : parentThreadId,
+          parentThread: parentDriver === null ? null : parentThreadId,
+          relationship: parentDriver === null ? null : "subagent",
+          parentNative:
+            parentDriver === null || nativeRef !== "present" || parentReadFailure !== null
+              ? null
+              : { driver: ProviderDriverKind.make(parentDriver), nativeId: "active-native", kind },
+        });
+      }).pipe(
+        Effect.provide(
+          layerTest({
+            state,
+            idleTimeoutMs: 1_000,
+            beforeOpen: (input) => Ref.set(captured, input),
+            ...(title === "" || parentReadFailure !== null
+              ? {
+                  projectionStoreLayer: Layer.effect(
+                    ProjectionStore.ProjectionStoreV2,
+                    Effect.gen(function* () {
+                      const store = yield* ProjectionStore.ProjectionStoreV2;
+                      return ProjectionStore.ProjectionStoreV2.of({
+                        ...store,
+                        getThread: (id) =>
+                          parentReadFailure === "thread" && id === "lineage-parent"
+                            ? Effect.fail(
+                                new ProjectionStore.ProjectionStoreReadError({ threadId: id }),
+                              )
+                            : store
+                                .getThread(id)
+                                .pipe(
+                                  Effect.map((thread) =>
+                                    title === "" ? { ...thread, title: "" } : thread,
+                                  ),
+                                ),
+                        getThreadProviderContext: (id, instanceId) =>
+                          parentReadFailure === "context" && id === "lineage-parent"
+                            ? Effect.fail(
+                                new ProjectionStore.ProjectionStoreReadError({ threadId: id }),
+                              )
+                            : store.getThreadProviderContext(id, instanceId),
+                      });
+                    }),
+                  ).pipe(Layer.provide(layerTestStores)),
+                }
+              : {}),
+          }),
+        ),
+      );
+    }),
+);
+
+it.effect(
+  "ProviderSessionManagerV2 opens without session lineage when the projection read fails",
+  () =>
+    Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      const captured = yield* Ref.make<
+        ProviderAdapter.ProviderAdapterV2OpenSessionInput | undefined
+      >(undefined);
+      const failingProjection = Layer.effect(
+        ProjectionStore.ProjectionStoreV2,
+        Effect.gen(function* () {
+          const store = yield* ProjectionStore.ProjectionStoreV2;
+          return ProjectionStore.ProjectionStoreV2.of({
+            ...store,
+            getThread: (threadId) =>
+              Effect.fail(new ProjectionStore.ProjectionStoreReadError({ threadId })),
+          });
+        }),
+      ).pipe(Layer.provide(layerTestStores));
+      yield* Effect.gen(function* () {
+        const idAllocator = yield* IdAllocator.IdAllocatorV2;
+        const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+        const threadId = ThreadId.make("lineage-read-failure");
+        const providerSessionId = yield* idAllocator.allocate.providerSession({
+          providerInstanceId: modelSelection.instanceId,
+          threadId,
+        });
+        yield* manager.open({ threadId, providerSessionId, modelSelection, runtimePolicy });
+        assert.isDefined(yield* Ref.get(captured));
+        assert.isUndefined((yield* Ref.get(captured))?.lineage);
+        assert.equal((yield* Ref.get(state)).openCount, 1);
+      }).pipe(
+        Effect.provide(
+          layerTest({
+            state,
+            idleTimeoutMs: 1_000,
+            beforeOpen: (input) => Ref.set(captured, input),
+            projectionStoreLayer: failingProjection,
+          }),
+        ),
+      );
+    }),
 );

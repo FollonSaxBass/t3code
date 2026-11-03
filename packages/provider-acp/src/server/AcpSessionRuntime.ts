@@ -2508,12 +2508,13 @@ export const make = Effect.fn("AcpSessionRuntime.make")(function* (
     forkSession: (sessionId, activationOptions, meta) =>
       start.pipe(
         Effect.flatMap((started) => {
+          const setupFields = sessionSetupFields(started.initializeResult);
           const requestPayload = {
             sessionId,
             cwd: options.cwd,
-            ...sessionSetupFields(started.initializeResult),
+            ...setupFields,
             mcpServers: sessionMcpServers(started.initializeResult, activationOptions),
-            ...(meta === undefined ? {} : { _meta: meta }),
+            ...(meta === undefined ? {} : { _meta: { ...setupFields._meta, ...meta } }),
           } satisfies EffectAcpSchema.ForkSessionRequest;
           return runLoggedRequest(
             "session/fork",

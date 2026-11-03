@@ -54,6 +54,8 @@ export function sanitizePrTitle(raw: string): string {
   return "Update project changes";
 }
 
+export const DEFAULT_THREAD_TITLE = "New thread";
+
 const MAX_THREAD_TITLE_CHARS = 120;
 
 export function sanitizeThreadTitle(raw: string): string {
@@ -69,7 +71,7 @@ export function sanitizeThreadTitle(raw: string): string {
     .replace(/\s+/g, " ");
 
   if (!normalized || normalized.trim().length === 0) {
-    return "New thread";
+    return DEFAULT_THREAD_TITLE;
   }
 
   if (normalized.length <= MAX_THREAD_TITLE_CHARS) {

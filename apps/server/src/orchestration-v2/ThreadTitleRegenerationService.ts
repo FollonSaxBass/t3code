@@ -1,3 +1,4 @@
+import { DEFAULT_THREAD_TITLE } from "@t3tools/provider-core/server/textGenerationUtils";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
 import { isAttachmentOnlyBootstrapPrompt } from "@t3tools/shared/composerContextReferences";
 import {
@@ -214,7 +215,7 @@ const make = Effect.gen(function* () {
         projectId: projection.thread.projectId,
       });
       const generatedTitle = result.title.trim();
-      return generatedTitle === "New thread" ||
+      return generatedTitle === DEFAULT_THREAD_TITLE ||
         (input.kind.type === "regenerate" && generatedTitle === projection.thread.title.trim())
         ? { status: "unchanged" as const }
         : { status: "renamed" as const, title: result.title };

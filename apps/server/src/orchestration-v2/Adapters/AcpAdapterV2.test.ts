@@ -24,6 +24,8 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   ProviderSessionId,
+  ProviderTurnId,
+  NodeId,
   ThreadId,
   type OrchestrationV2ProviderThread,
   type OrchestrationV2TurnItem,
@@ -102,6 +104,7 @@ import {
 } from "@t3tools/provider-acp-registry/testing";
 
 const DEFAULT_GROK_SETTINGS = Schema.decodeSync(GrokSettings)({});
+const decodeAcpRegistrySettings = Schema.decodeEffect(AcpRegistrySettings);
 const DROID_SETTINGS = Schema.decodeSync(AcpRegistrySettings)({ agentId: "factory-droid" });
 const OMP_SETTINGS = Schema.decodeSync(AcpRegistrySettings)({
   source: "local",
@@ -172,6 +175,213 @@ const bundleAgents = Effect.gen(function* () {
 
 const ACP_TEST_DRIVER = ProviderDriverKind.make("acp-test");
 const decodeUnknownJson = Schema.decodeUnknownOption(Schema.fromJsonString(Schema.Unknown));
+
+it.live.each([
+  { sessionLineage: false, method: "session/new" },
+  { sessionLineage: false, method: "session/load" },
+  { sessionLineage: false, method: "session/resume" },
+  { sessionLineage: true, method: "session/new" },
+  { sessionLineage: true, method: "session/load" },
+  { sessionLineage: true, method: "session/resume" },
+  { sessionLineage: true, method: "session/fork", earlierTurn: false },
+  { sessionLineage: true, method: "session/fork", earlierTurn: true },
+  { sessionLineage: false, method: "session/fork", earlierTurn: true },
+] as const)(
+  "session lineage metadata: $sessionLineage on $method, earlier turn $earlierTurn",
+  (scenario) =>
+    Effect.gen(function* () {
+      const { sessionLineage, method } = scenario;
+      const isFork = method === "session/fork";
+      const earlierTurn = "earlierTurn" in scenario && scenario.earlierTurn;
+      const forkMeta = earlierTurn ? { "test/forkFromTurn": "earlier-native-turn" } : {};
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const directory = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-lineage-" });
+      const driver = ProviderDriverKind.make("acpRegistry");
+      const threadId = ThreadId.make("lineage-child");
+      const lineage = {
+        v: 1,
+        thread: threadId,
+        title: "Child task",
+        rootThread: ThreadId.make("lineage-parent"),
+        parentThread: ThreadId.make("lineage-parent"),
+        relationship: "subagent",
+        parentNative: {
+          driver: ProviderDriverKind.make("codex"),
+          nativeId: "parent-native",
+          kind: "codex",
+        },
+      } as const;
+      const transcript = yield* decodeAcpReplayTranscript(
+        {
+          provider: driver,
+          protocol: "acp.ndjson-jsonrpc",
+          version: "1",
+          scenario: "session-lineage",
+          entries: [
+            {
+              type: "expect_outbound",
+              frame: { kind: "request", method: "initialize", params: "<any>" },
+            },
+            {
+              type: "emit_inbound",
+              frame: {
+                kind: "response",
+                method: "initialize",
+                result: {
+                  protocolVersion: 1,
+                  agentCapabilities:
+                    method === "session/load"
+                      ? { loadSession: true }
+                      : method === "session/resume" || isFork
+                        ? { sessionCapabilities: { resume: {}, ...(isFork ? { fork: {} } : {}) } }
+                        : {},
+                  authMethods: [],
+                },
+              },
+            },
+            {
+              type: "expect_outbound",
+              frame: {
+                kind: "request",
+                method: isFork ? "session/resume" : method,
+                params: {
+                  cwd: "<workspace>",
+                  mcpServers: [],
+                  ...(method === "session/new" ? {} : { sessionId: "existing-session" }),
+                  ...(sessionLineage ? { _meta: { "t3code/lineage": lineage } } : {}),
+                },
+              },
+            },
+            {
+              type: "emit_inbound",
+              frame: {
+                kind: "response",
+                method: isFork ? "session/resume" : method,
+                result: method === "session/new" ? { sessionId: "new-session" } : {},
+              },
+            },
+            ...(isFork
+              ? [
+                  {
+                    type: "expect_outbound" as const,
+                    frame: {
+                      kind: "request",
+                      method: "session/fork",
+                      params: {
+                        cwd: "<workspace>",
+                        mcpServers: [],
+                        sessionId: "existing-session",
+                        ...(sessionLineage || earlierTurn
+                          ? {
+                              _meta: {
+                                ...(sessionLineage ? { "t3code/lineage": lineage } : {}),
+                                ...forkMeta,
+                              },
+                            }
+                          : {}),
+                      },
+                    },
+                  },
+                  {
+                    type: "emit_inbound" as const,
+                    frame: {
+                      kind: "response",
+                      method: "session/fork",
+                      result: { sessionId: "forked-session" },
+                    },
+                  },
+                ]
+              : []),
+          ],
+        },
+        driver,
+      );
+      const instanceId = ProviderInstanceId.make("lineage");
+      const makeRuntime = makeAcpReplayRuntime({
+        transcript,
+        statusPath: path.join(directory, "status.json"),
+        fileSystem,
+        scriptPath: yield* path.fromFileUrl(
+          new URL("../../../scripts/acp-replay-agent.ts", import.meta.url),
+        ),
+        childProcessSpawner: yield* ChildProcessSpawner.ChildProcessSpawner,
+      });
+      const selfInvocation = yield* resolveSelfInvocation();
+      const adapter = yield* (
+        isFork
+          ? makeAcpAdapterV2({
+              instanceId,
+              selfInvocation,
+              flavor: {
+                driver,
+                sessionLineage,
+                capabilities: AcpProviderCapabilitiesV2,
+                makeRuntime,
+                forkFromTurn: {
+                  supported: () => true,
+                  nativeTurnId: () => undefined,
+                  forkMeta: (nativeTurnId) => ({ "test/forkFromTurn": nativeTurnId }),
+                },
+              },
+            })
+          : makeAcpRegistryAdapterV2({
+              instanceId,
+              selfInvocation,
+              settings: yield* decodeAcpRegistrySettings({
+                agentId: "test-agent",
+                sessionLineage,
+              }),
+              environment: {},
+              makeRuntime,
+            })
+      ).pipe(
+        Effect.provide(
+          Layer.mock(AcpRegistryCatalog)({ resolve: () => Effect.die("runtime is injected") }),
+        ),
+      );
+      const input = {
+        threadId,
+        providerSessionId: ProviderSessionId.make("lineage-session"),
+        modelSelection: { instanceId, model: "default" },
+        runtimePolicy: ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+          runtimeMode: "approval-required",
+          interactionMode: "default",
+          cwd: directory,
+        }),
+        lineage,
+        ...(method === "session/new" ? {} : { initialNativeThreadId: "existing-session" }),
+      };
+      const runtime = yield* adapter.openSession(input);
+      assert.equal(runtime.providerSessionId, input.providerSessionId);
+      if (isFork) {
+        const sourceProviderThread = yield* runtime.ensureThread(input);
+        const turns = [1, 2].map((ordinal) => ({
+          id: ProviderTurnId.make(`turn-${ordinal}`),
+          providerThreadId: sourceProviderThread.id,
+          nodeId: NodeId.make(`node-${ordinal}`),
+          runAttemptId: null,
+          nativeTurnRef: {
+            driver,
+            nativeId: ordinal === 1 ? "earlier-native-turn" : "head-native-turn",
+            strength: "strong" as const,
+          },
+          ordinal,
+          status: "completed" as const,
+          startedAt: null,
+          completedAt: null,
+        }));
+        const forked = yield* runtime.forkThread({
+          sourceProviderThread,
+          targetThreadId: ThreadId.make("fork-target"),
+          ...(earlierTurn
+            ? { providerTurnId: ProviderTurnId.make("turn-1"), sourceProviderTurns: turns }
+            : {}),
+        });
+        assert.equal(forked.nativeThreadRef?.nativeId, "forked-session");
+      }
+    }).pipe(Effect.provide(layerTest), Effect.scoped),
+);
 
 describe("acpPerTurnPromptUsage", () => {
   it("maps a per-turn sample straight onto TurnTokenUsage", () => {

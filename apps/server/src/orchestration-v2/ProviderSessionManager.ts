@@ -1,3 +1,4 @@
+import { DEFAULT_THREAD_TITLE } from "@t3tools/provider-core/server/textGenerationUtils";
 import { AgentScope } from "@t3tools/shared/AgentScope";
 import * as KeyedLock from "@t3tools/shared/KeyedLock";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
@@ -616,6 +617,48 @@ export const layerWithOptions = (
                 return { mcpCredentialId: credential.config.providerSessionId, issued: true };
               }),
             );
+      const readSessionLineage = Effect.fn("ProviderSessionManagerV2.readSessionLineage")(
+        function* (threadId: ThreadId) {
+          const thread = yield* projectionStore.getThread(threadId);
+          const parentThreadId = thread.lineage.parentThreadId;
+          const parentNative =
+            parentThreadId === null
+              ? null
+              : yield* Effect.gen(function* () {
+                  const parent = yield* projectionStore.getThread(parentThreadId);
+                  const context = yield* projectionStore.getThreadProviderContext(
+                    parentThreadId,
+                    parent.providerInstanceId,
+                  );
+                  const active = context.providerThreads.find(
+                    (candidate) => candidate.id === context.thread.activeProviderThreadId,
+                  );
+                  const nativeRef = active?.nativeThreadRef;
+                  if (nativeRef == null || nativeRef.nativeId === null) return null;
+                  const { driver, nativeId } = nativeRef;
+                  return {
+                    driver,
+                    nativeId,
+                    kind:
+                      driver === "claudeAgent"
+                        ? ("claude-code" as const)
+                        : driver === "codex"
+                          ? ("codex" as const)
+                          : null,
+                  };
+                }).pipe(Effect.orElseSucceed(() => null));
+          return {
+            v: 1,
+            thread: thread.id,
+            title: thread.title === DEFAULT_THREAD_TITLE ? null : thread.title || null,
+            rootThread: thread.lineage.rootThreadId,
+            parentThread: parentThreadId,
+            relationship: thread.lineage.relationshipToParent,
+            parentNative,
+          } satisfies ProviderAdapter.ProviderSessionLineage;
+        },
+        Effect.orElseSucceed(() => undefined),
+      );
       const clearMcpSession = (threadId: ThreadId, mcpCredentialId?: string) =>
         mcpCredentialId === undefined
           ? mcpSessionRegistry
@@ -2908,10 +2951,12 @@ export const layerWithOptions = (
               });
               const sessionScope = yield* Scope.fork(sessionScopes);
               yield* agentScope.clear(input.threadId);
+              const lineage = yield* readSessionLineage(input.threadId);
               const runtime = yield* installationGate
                 .execute(
                   input.modelSelection.instanceId,
                   adapter.openSession({
+                    ...(lineage === undefined ? {} : { lineage }),
                     threadId: input.threadId,
                     providerSessionId: input.providerSessionId,
                     modelSelection: input.modelSelection,
