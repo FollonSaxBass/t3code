@@ -102,6 +102,23 @@ function providerWithModels(
   });
 }
 
+describe("ACP session lineage settings", () => {
+  it("decodes an explicit opt-in", () => {
+    expect(decodeSettings({ sessionLineage: true }).sessionLineage).toBe(true);
+  });
+
+  it("defaults session lineage to off", () => {
+    expect(decodeSettings({}).sessionLineage).toBe(false);
+  });
+
+  it("keeps old settings valid and preserves explicit opt-out", () => {
+    expect(decodeSettings({ agentId: "test-agent" }).agentId).toBe("test-agent");
+    expect(
+      decodeSettings({ agentId: "test-agent", sessionLineage: false }).sessionLineage,
+    ).not.toBe(true);
+  });
+});
+
 describe("acpRegistrySnapshotReadiness", () => {
   it("keeps the custom model display name and options saved by the Settings editor", () => {
     const fastMode = { id: "fast", label: "Fast mode", type: "boolean" } as const;
