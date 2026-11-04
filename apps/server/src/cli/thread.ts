@@ -737,31 +737,67 @@ const decodeThreadId = (value: string) =>
     Effect.mapError(() => new ThreadUsageError({ detail: `'${value}' is not a thread id.` })),
   );
 
+/** With no project id, page unsettled roots across every project. */
+export const listThreads = Effect.fn("cli.thread.listThreads")(function* (
+  tools: ThreadTools,
+  projectId?: ProjectId,
+) {
+  const threads: Array<OrchestratorMcpThreadListItem> = [];
+  let cursor: number | null = 0;
+  while (cursor !== null) {
+    const page: OrchestratorMcpThreadListResult = yield* tools.call(
+      "t3_thread_list",
+      {
+        ...(projectId === undefined ? { allProjects: true, settled: false } : { projectId }),
+        includeSubagents: false,
+        limit: 100,
+        cursor,
+      },
+      OrchestratorMcpThreadListResult,
+    );
+    threads.push(...page.threads);
+    if (page.nextCursor !== null && page.nextCursor <= cursor) {
+      return yield* new ThreadToolFailedError({
+        tool: "t3_thread_list",
+        detail: "The server returned a non-advancing thread list cursor.",
+      });
+    }
+    cursor = page.nextCursor;
+  }
+  return threads;
+});
+
 const threadListCommand = Command.make("list", {
   ...projectLocationFlags,
   project: Flag.String("project").pipe(
     Flag.withDescription("Project id or a path inside the project. Defaults to this directory."),
-    Flag.withDefault("."),
+    Flag.optional,
+  ),
+  allProjects: Flag.Boolean("all-projects").pipe(
+    Flag.withDescription(
+      "List unsettled root threads across all projects, including snoozed threads.",
+    ),
+    Flag.withDefault(false),
   ),
   json: jsonFlag,
 }).pipe(
-  Command.withDescription("List a project's threads, newest first."),
+  Command.withDescription("List a project's threads, or unsettled roots across all projects."),
   Command.withHandler((flags) =>
     withThreadTools(
       flags,
       Effect.fn("cli.thread.list")(function* (tools) {
-        const project = yield* resolveProject(tools, flags.project);
-        const threads: Array<OrchestratorMcpThreadListItem> = [];
-        let cursor: number | null = 0;
-        while (cursor !== null) {
-          const page: OrchestratorMcpThreadListResult = yield* tools.call(
-            "t3_thread_list",
-            { projectId: project.id, includeSubagents: false, limit: 100, cursor },
-            OrchestratorMcpThreadListResult,
-          );
-          threads.push(...page.threads);
-          cursor = page.nextCursor;
+        if (flags.allProjects && Option.isSome(flags.project)) {
+          return yield* new ThreadUsageError({
+            detail: "--all-projects cannot be combined with --project.",
+          });
         }
+        const projectId = flags.allProjects
+          ? undefined
+          : (yield* resolveProject(
+              tools,
+              Option.getOrElse(flags.project, () => "."),
+            )).id;
+        const threads = yield* listThreads(tools, projectId);
         if (flags.json) {
           return yield* printJson(threads);
         }
