@@ -26,6 +26,7 @@ import {
 import {
   latestRunError,
   launchModelSelection,
+  listThreads,
   readLatestMessages,
   readOutputSchema,
   resolveProject,
@@ -768,4 +769,72 @@ it.live("resolves a path inside a git worktree of the project's repository to th
     assert.include(ambiguous.message, "sample (project-sample)");
     assert.include(ambiguous.message, "feature (project-feature)");
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+it.effect("all-project listing includes unsettled roots on every page", () =>
+  Effect.gen(function* () {
+    const { tools, calls } = scriptedTools({
+      t3_thread_list: [
+        {
+          threads: [{ threadId: ThreadId.make("root-a"), projectId: ProjectId.make("project-a") }],
+          nextCursor: 100,
+        },
+        {
+          threads: [{ threadId: ThreadId.make("root-b"), projectId: ProjectId.make("project-b") }],
+          nextCursor: null,
+        },
+      ],
+    });
+    const threads = yield* listThreads(tools);
+    assert.deepStrictEqual(
+      threads.map(({ threadId, projectId }) => ({ threadId, projectId })),
+      [
+        { threadId: ThreadId.make("root-a"), projectId: ProjectId.make("project-a") },
+        { threadId: ThreadId.make("root-b"), projectId: ProjectId.make("project-b") },
+      ],
+    );
+    assert.deepStrictEqual(
+      calls.map(({ args }) => args),
+      [
+        { allProjects: true, settled: false, includeSubagents: false, limit: 100, cursor: 0 },
+        { allProjects: true, settled: false, includeSubagents: false, limit: 100, cursor: 100 },
+      ],
+    );
+  }),
+);
+
+it.effect("project listing keeps delegated threads and leaves out subagents", () =>
+  Effect.gen(function* () {
+    const { tools, calls } = scriptedTools({
+      t3_thread_list: [
+        {
+          threads: [
+            { threadId: ThreadId.make("root"), relationshipToParent: null },
+            { threadId: ThreadId.make("child"), relationshipToParent: "subagent" },
+            { threadId: ThreadId.make("delegated"), relationshipToParent: null },
+          ],
+          nextCursor: null,
+        },
+      ],
+    });
+    const threads = yield* listThreads(tools, ProjectId.make("project-a"));
+    assert.deepStrictEqual(
+      threads.map(({ threadId }) => threadId),
+      [ThreadId.make("root"), ThreadId.make("delegated")],
+    );
+    assert.deepStrictEqual(
+      calls.map(({ args }) => args),
+      [{ projectId: "project-a", includeSubagents: true, limit: 100, cursor: 0 }],
+    );
+  }),
+);
+
+it.effect("listing refuses a cursor that would repeat a page", () =>
+  Effect.gen(function* () {
+    const { tools } = scriptedTools({
+      t3_thread_list: [{ threads: [], nextCursor: 0 }],
+    });
+    const error = yield* listThreads(tools).pipe(Effect.flip);
+    assert.strictEqual(error._tag, "ThreadToolFailedError");
+  }),
 );
