@@ -273,6 +273,8 @@ export interface LimitAccount {
   readonly key: string;
   readonly driver: ServerProvider["driver"];
   readonly displayName: string | null;
+  /** Names of the native instances merged into this account; more than one means they disagree. */
+  readonly instanceNames: readonly string[];
   readonly email: string | undefined;
   readonly plan: string | undefined;
   readonly accentColor: string | undefined;
@@ -339,13 +341,24 @@ export function collectLimitAccounts(presentations: LimitPresentations): readonl
       (account) => account.environments.length === 0 && account.email,
     );
     const displayName = previous.displayName ?? next.displayName;
+    const instanceNames = [...previous.instanceNames];
+    for (const name of next.instanceNames) {
+      if (!instanceNames.some((seen) => seen.toLowerCase() === name.toLowerCase())) {
+        instanceNames.push(name);
+      }
+    }
     accounts.set(key, {
       ...previous,
+      // Instances named differently on one login: no name is right, so fall back to the e-mail.
       displayName:
-        hubEmail &&
-        displayName?.toLowerCase() === PROVIDER_DISPLAY_NAMES[previous.driver]?.toLowerCase()
+        instanceNames.length > 1
           ? null
-          : displayName,
+          : (instanceNames[0] ??
+            (hubEmail &&
+            displayName?.toLowerCase() === PROVIDER_DISPLAY_NAMES[previous.driver]?.toLowerCase()
+              ? null
+              : displayName)),
+      instanceNames,
       plan: planSources.get(key)?.plan ?? previous.plan ?? next.plan,
       accentColor: previous.accentColor ?? next.accentColor,
       environments,
@@ -373,10 +386,17 @@ export function collectLimitAccounts(presentations: LimitPresentations): readonl
     const label = presentation.entry.target.label;
     for (const provider of providersWithLimits(presentation.serverConfig?.providers ?? [])) {
       if (!provider.usageLimits || limitsNotice(provider.usageLimits) !== null) continue;
+      const displayName = provider.displayName?.trim() || null;
       merge(resolveKey(nativeReport(provider)) ?? `${environmentId}:${provider.instanceId}`, {
         key: `${environmentId}:${provider.instanceId}`,
         driver: provider.driver,
-        displayName: provider.displayName?.trim() || null,
+        displayName,
+        // A default name ("Codex") is not a choice, so it never conflicts with a chosen one.
+        instanceNames:
+          displayName &&
+          displayName.toLowerCase() !== PROVIDER_DISPLAY_NAMES[provider.driver]?.toLowerCase()
+            ? [displayName]
+            : [],
         email: provider.auth.email,
         plan: provider.auth.label,
         accentColor: provider.accentColor,
@@ -403,6 +423,7 @@ export function collectLimitAccounts(presentations: LimitPresentations): readonl
           key,
           driver: account.driver,
           displayName: account.email ? null : hubAccountName(account),
+          instanceNames: [],
           email: account.email,
           plan: account.plan,
           accentColor: undefined,

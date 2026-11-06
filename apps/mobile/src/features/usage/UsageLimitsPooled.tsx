@@ -617,6 +617,11 @@ export function UsageLimitAccountScreen({ route }: AccountScreenProps) {
               ) : (
                 <Text className="text-sm text-foreground-muted">{account.sourceLabel}</Text>
               )}
+              {account.instanceNames.length > 1 ? (
+                <Text className="text-sm text-foreground-muted">
+                  Named {account.instanceNames.join(", ")}
+                </Text>
+              ) : null}
             </View>
             {account.redeem && account.limits.resetCredits ? (
               <View className="gap-3 rounded-[24px] border-continuous bg-grouped-card p-4">

@@ -179,6 +179,9 @@ function SegmentPopover({
         {where ? (
           <Row label={account.environments.length > 0 ? "Signed in" : "Via"}>{where}</Row>
         ) : null}
+        {account.instanceNames.length > 1 ? (
+          <Row label="Named">{account.instanceNames.join(", ")}</Row>
+        ) : null}
       </div>
       <div className="flex flex-col gap-1 border-t border-border/60 pt-2.5">
         <Row label="Left">{remaining}%</Row>
