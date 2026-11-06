@@ -612,6 +612,7 @@ export function UsageLimitAccountScreen({ route }: AccountScreenProps) {
                 account.environments.map((environment) => (
                   <Text key={environment.environmentId} className="text-sm text-foreground-muted">
                     {environment.label}
+                    {environment.offline ? " (offline)" : ""}
                   </Text>
                 ))
               ) : (

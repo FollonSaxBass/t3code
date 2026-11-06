@@ -236,7 +236,7 @@ describe("pools", () => {
     label: "hub",
     checkedAt,
   };
-  const laptop = { entry: { target: { label: "Laptop" } } };
+  const laptop = { entry: { target: { label: "Laptop" } }, connection: { phase: "available" } };
 
   it("merges one account reported natively on two environments and by a hub into one entry", () => {
     const native = provider({
@@ -251,6 +251,7 @@ describe("pools", () => {
         EnvironmentId.make("env-b"),
         {
           entry: { target: { label: "Desktop" } },
+          connection: { phase: "available" },
           serverConfig: {
             providers: [
               {
@@ -286,8 +287,8 @@ describe("pools", () => {
       sourceLabel: null,
       redeem: { environmentId: "env-b", input: { instanceId: "claude" } },
       environments: [
-        { environmentId: "env-a", label: "Laptop" },
-        { environmentId: "env-b", label: "Desktop" },
+        { environmentId: "env-a", label: "Laptop", offline: false },
+        { environmentId: "env-b", label: "Desktop", offline: false },
       ],
     });
     expect(accounts[0]?.limits.windows[0]?.usedPercent).toBe(55);
@@ -350,6 +351,7 @@ describe("pools", () => {
         EnvironmentId.make("env-b"),
         {
           entry: { target: { label: "Desktop" } },
+          connection: { phase: "available" },
           serverConfig: {
             providers: [
               {
@@ -368,8 +370,8 @@ describe("pools", () => {
     const accounts = collectLimitAccounts(input);
     expect(accounts).toHaveLength(1);
     expect(accounts[0]?.environments).toEqual([
-      { environmentId: "env-a", label: "Laptop" },
-      { environmentId: "env-b", label: "Desktop" },
+      { environmentId: "env-a", label: "Laptop", offline: false },
+      { environmentId: "env-b", label: "Desktop", offline: false },
     ]);
     expect(collectLimitPools(accounts, now)[0]?.windows[0]?.members).toHaveLength(1);
     expect(accounts[0]?.limits.windows[0]?.usedPercent).toBe(4);
@@ -380,6 +382,7 @@ describe("pools", () => {
     };
     input.set(EnvironmentId.make("env-b"), {
       entry: { target: { label: "Desktop" } },
+      connection: { phase: "available" },
       serverConfig: { providers: [differentKey] },
     });
     expect(collectLimitAccounts(input)).toHaveLength(2);
@@ -392,6 +395,7 @@ describe("pools", () => {
     });
     input.set(EnvironmentId.make("env-b"), {
       entry: { target: { label: "Desktop" } },
+      connection: { phase: "available" },
       serverConfig: {
         providers: [
           { ...differentKey, auth: { status: "authenticated", email: "SAME@example.com" } },
@@ -482,7 +486,9 @@ describe("pools", () => {
     expect(account?.limits.windows[0]?.usedPercent).toBe(55);
     expect(account?.limits.resetCredits?.availableCount).toBe(2);
     expect(account?.redeem).toEqual({ environmentId: "env-a", input: { instanceId: "claude" } });
-    expect(account?.environments).toEqual([{ environmentId: "env-a", label: "Laptop" }]);
+    expect(account?.environments).toEqual([
+      { environmentId: "env-a", label: "Laptop", offline: false },
+    ]);
   });
 
   it("redeems through the hub when it holds a credit, even with a fresher native read", () => {
@@ -553,7 +559,11 @@ describe("pools", () => {
       [EnvironmentId.make("env-a"), { ...laptop, serverConfig: { providers: [stale] } }],
       [
         EnvironmentId.make("env-b"),
-        { entry: { target: { label: "Desktop" } }, serverConfig: { providers: [fresh] } },
+        {
+          entry: { target: { label: "Desktop" } },
+          connection: { phase: "available" },
+          serverConfig: { providers: [fresh] },
+        },
       ],
     ]);
     const [account] = collectLimitAccounts(input);
@@ -655,6 +665,7 @@ describe("pools", () => {
         EnvironmentId.make("env-b"),
         {
           entry: { target: { label: "Desktop" } },
+          connection: { phase: "available" },
           serverConfig: { providers: [login("personal", "ws-plus", 26)] },
         },
       ],
@@ -823,6 +834,7 @@ describe("pools", () => {
           EnvironmentId.make("env-b"),
           {
             entry: { target: { label: "Desktop" } },
+            connection: { phase: "available" },
             serverConfig: { providers: [], usageLimitSources: [hubAt(secondId, secondEndpoint)] },
           },
         ],
@@ -863,6 +875,7 @@ describe("pools", () => {
         EnvironmentId.make("env-b"),
         {
           entry: { target: { label: "Desktop" } },
+          connection: { phase: "available" },
           serverConfig: {
             providers: [],
             usageLimitSources: [hubAt("second", "new@example.com", 80)],
@@ -947,6 +960,7 @@ describe("pools", () => {
         EnvironmentId.make("env-a"),
         {
           ...laptop,
+          connection: { phase: "available" },
           serverConfig: {
             providers: [
               signedIn("claude", "Claude Ann", "bob@example.com"),
@@ -959,6 +973,7 @@ describe("pools", () => {
         EnvironmentId.make("env-b"),
         {
           entry: { target: { label: "Desktop" } },
+          connection: { phase: "available" },
           serverConfig: {
             providers: [
               signedIn("claude", "Claude Ann", "ann@example.com"),
@@ -980,6 +995,55 @@ describe("pools", () => {
       { displayName: "Claude Carol", instanceNames: ["Claude Carol"], email: "carol@example.com" },
       { displayName: "Claude Ann", instanceNames: ["Claude Ann"], email: "ann@example.com" },
     ]);
+
+    for (const phase of [
+      "offline",
+      "connecting",
+      "reconnecting",
+      "connected",
+      "error",
+      "unsupported",
+    ]) {
+      const desktop = input.get(EnvironmentId.make("env-b"))!;
+      const offline = {
+        ...desktop,
+        connection: { phase },
+        serverConfig: {
+          providers: desktop.serverConfig.providers.map((entry) => ({
+            ...entry,
+            usageLimits: {
+              checkedAt: "2026-09-03T11:30:00.000Z",
+              windows: [{ ...window, usedPercent: 90 }],
+            },
+          })),
+        },
+      };
+      const entries = [...input].map(
+        ([id, entry]) => [id, id === "env-b" ? offline : entry] as const,
+      );
+      for (const ordered of [entries, entries.toReversed()]) {
+        const accounts = collectLimitAccounts(new Map(ordered));
+        const bob = accounts.find((account) => account.email === "bob@example.com");
+        expect(bob).toMatchObject({
+          displayName: "Claude Ann",
+          instanceNames: ["Claude Ann"],
+          limits: { windows: [{ usedPercent: 40 }] },
+        });
+        expect(bob?.environments).toEqual([
+          { environmentId: "env-a", label: "Laptop", offline: false },
+          { environmentId: "env-b", label: "Desktop", offline: true },
+        ]);
+        expect(accounts.find((account) => account.email === "ann@example.com")).toMatchObject({
+          displayName: "Claude Ann",
+          instanceNames: ["Claude Ann"],
+          environments: [{ environmentId: "env-b", label: "Desktop", offline: true }],
+        });
+        expect(accounts.find((account) => account.email === "carol@example.com")).toMatchObject({
+          displayName: "Claude",
+          instanceNames: [],
+        });
+      }
+    }
   });
 
   it("pools Codex windows by kind, whichever slot reported them", () => {
@@ -1834,6 +1898,7 @@ describe("external usage settings", () => {
         EnvironmentId.make("a"),
         {
           entry: { target: { label: "A" } },
+          connection: { phase: "available" },
           serverConfig: {
             providers: [managed, { ...managed, instanceId: ProviderInstanceId.make("personal") }],
           },
@@ -1841,7 +1906,11 @@ describe("external usage settings", () => {
       ],
       [
         EnvironmentId.make("b"),
-        { entry: { target: { label: "B" } }, serverConfig: { providers: [managed] } },
+        {
+          entry: { target: { label: "B" } },
+          connection: { phase: "available" },
+          serverConfig: { providers: [managed] },
+        },
       ],
     ]);
     expect(collectExternalUsageLinks(presentations)).toEqual([
@@ -1863,7 +1932,11 @@ describe("external usage settings", () => {
         unavailable: { reason: "probeFailed" },
       },
     });
-    const host = { entry: { target: { label: "Host" } }, serverConfig: { providers: [failing] } };
+    const host = {
+      entry: { target: { label: "Host" } },
+      connection: { phase: "available" },
+      serverConfig: { providers: [failing] },
+    };
     const presentations = new Map([
       [EnvironmentId.make("a"), host],
       [EnvironmentId.make("b"), host],

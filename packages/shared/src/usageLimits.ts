@@ -175,6 +175,7 @@ export type LimitPresentations = ReadonlyMap<
   EnvironmentId,
   {
     readonly entry: { readonly target: { readonly label: string } };
+    readonly connection: { readonly phase: string };
     readonly serverConfig: {
       readonly providers: readonly ServerProvider[];
       readonly usageLimitSources?: UsageLimitSourceSnapshots | undefined;
@@ -281,6 +282,7 @@ export interface LimitAccount {
   readonly environments: ReadonlyArray<{
     readonly environmentId: EnvironmentId;
     readonly label: string;
+    readonly offline: boolean;
   }>;
   readonly sourceLabel: string | null;
   readonly redeem: {
@@ -295,7 +297,21 @@ export function collectLimitAccounts(presentations: LimitPresentations): readonl
   const creditSources = new Map<string, LimitAccount>();
   const hubRedeems = new Map<string, LimitAccount>();
   const planSources = new Map<string, LimitAccount>();
-  const merge = (key: string, next: LimitAccount) => {
+  const availableAccounts = new Set<string>();
+  const merge = (available: boolean, key: string, next: LimitAccount) => {
+    const previous = accounts.get(key);
+    const environments = [
+      ...(previous?.environments ?? []),
+      ...next.environments.filter(
+        (candidate) =>
+          !previous?.environments.some((seen) => seen.environmentId === candidate.environmentId),
+      ),
+    ];
+    if (previous && !available && availableAccounts.has(key)) {
+      accounts.set(key, { ...previous, environments });
+      return;
+    }
+    if (available) availableAccounts.add(key);
     // Prefer hub redemption to clear its routing cooldown too; displayed balance still follows the freshest read.
     const previousHub = hubRedeems.get(key);
     if (
@@ -321,19 +337,11 @@ export function collectLimitAccounts(presentations: LimitPresentations): readonl
     ) {
       planSources.set(key, next);
     }
-    const previous = accounts.get(key);
     if (!previous) {
       accounts.set(key, next);
       return;
     }
     const fresher = Date.parse(next.limits.checkedAt) > Date.parse(previous.limits.checkedAt);
-    const environments = [
-      ...previous.environments,
-      ...next.environments.filter(
-        (candidate) =>
-          !previous.environments.some((seen) => seen.environmentId === candidate.environmentId),
-      ),
-    ];
     const winner = fresher ? next : previous;
     const creditSource = creditSources.get(key);
     // A hub e-mail names the account better than the driver's default instance name.
@@ -382,13 +390,21 @@ export function collectLimitAccounts(presentations: LimitPresentations): readonl
       ...(presentation.serverConfig?.usageLimitSources ?? []).flatMap((source) => source.accounts),
     ]),
   );
-  for (const [environmentId, presentation] of presentations) {
+  const labelEnvironment = presentations.size > 1;
+  const ordered = [...presentations].sort(
+    ([, left], [, right]) =>
+      Number(right.connection.phase === "available") -
+      Number(left.connection.phase === "available"),
+  );
+  for (const [environmentId, presentation] of ordered) {
+    const available = presentation.connection.phase === "available";
     const label = presentation.entry.target.label;
     for (const provider of providersWithLimits(presentation.serverConfig?.providers ?? [])) {
       if (!provider.usageLimits || limitsNotice(provider.usageLimits) !== null) continue;
       const displayName = provider.displayName?.trim() || null;
-      merge(resolveKey(nativeReport(provider)) ?? `${environmentId}:${provider.instanceId}`, {
-        key: `${environmentId}:${provider.instanceId}`,
+      const key = `${environmentId}:${provider.instanceId}`;
+      merge(available, resolveKey(nativeReport(provider)) ?? key, {
+        key,
         driver: provider.driver,
         displayName,
         // A default name ("Codex") is not a choice, so it never conflicts with a chosen one.
@@ -400,15 +416,12 @@ export function collectLimitAccounts(presentations: LimitPresentations): readonl
         email: provider.auth.email,
         plan: provider.auth.label,
         accentColor: provider.accentColor,
-        environments: [{ environmentId, label }],
+        environments: [{ environmentId, label, offline: !available }],
         sourceLabel: null,
         redeem: { environmentId, input: { instanceId: provider.instanceId } },
         limits: provider.usageLimits,
       });
     }
-  }
-  const labelEnvironment = presentations.size > 1;
-  for (const [environmentId, presentation] of presentations) {
     for (const source of presentation.serverConfig?.usageLimitSources ?? []) {
       const sourceLabel = labelEnvironment
         ? `${presentation.entry.target.label} · ${source.label}`
@@ -419,7 +432,7 @@ export function collectLimitAccounts(presentations: LimitPresentations): readonl
         // A resolved account already has an identity; its public key must stay distinct from others'.
         const hub = resolved ? `${environmentId}:${source.id}` : hubIdentity(environmentId, source);
         const key = `${hub}:${account.id}${account.workspaceId ? `:${account.workspaceId}` : ""}`;
-        merge(resolved ?? key, {
+        merge(available, resolved ?? key, {
           key,
           driver: account.driver,
           displayName: account.email ? null : hubAccountName(account),
