@@ -933,6 +933,55 @@ describe("pools", () => {
     ]);
   });
 
+  it("labels one login by e-mail when its instances carry different names", () => {
+    const signedIn = (instanceId: string, displayName: string, email: string) =>
+      provider({
+        driver: claude,
+        instanceId: ProviderInstanceId.make(instanceId),
+        displayName,
+        auth: { status: "authenticated", email },
+        usageLimits: { checkedAt, windows: [window] },
+      });
+    const input = new Map([
+      [
+        EnvironmentId.make("env-a"),
+        {
+          ...laptop,
+          serverConfig: {
+            providers: [
+              signedIn("claude", "Claude Ann", "bob@example.com"),
+              signedIn("claude-default", "Claude", "carol@example.com"),
+            ],
+          },
+        },
+      ],
+      [
+        EnvironmentId.make("env-b"),
+        {
+          entry: { target: { label: "Desktop" } },
+          serverConfig: {
+            providers: [
+              signedIn("claude", "Claude Ann", "ann@example.com"),
+              signedIn("claude-bob", "Claude Bob", "bob@example.com"),
+              signedIn("claude-carol", "Claude Carol", "carol@example.com"),
+            ],
+          },
+        },
+      ],
+    ]);
+    expect(
+      collectLimitAccounts(input).map(({ displayName, instanceNames, email }) => ({
+        displayName,
+        instanceNames,
+        email,
+      })),
+    ).toEqual([
+      { displayName: null, instanceNames: ["Claude Ann", "Claude Bob"], email: "bob@example.com" },
+      { displayName: "Claude Carol", instanceNames: ["Claude Carol"], email: "carol@example.com" },
+      { displayName: "Claude Ann", instanceNames: ["Claude Ann"], email: "ann@example.com" },
+    ]);
+  });
+
   it("pools Codex windows by kind, whichever slot reported them", () => {
     const codexAccount = (id: string, slots: readonly string[]) => ({
       id,
@@ -1112,6 +1161,7 @@ describe("pools", () => {
           key: "go",
           driver: claude,
           displayName: "Go",
+          instanceNames: [],
           email: undefined,
           plan: undefined,
           accentColor: undefined,
@@ -1163,6 +1213,7 @@ describe("pooled account columns", () => {
     key,
     driver: ProviderDriverKind.make("claudeAgent"),
     displayName: key,
+    instanceNames: [],
     email: undefined,
     plan: undefined,
     accentColor: undefined,
