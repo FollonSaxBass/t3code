@@ -154,7 +154,9 @@ function SegmentPopover({
   const resetsIn = formatResetsIn(window, now);
   const where =
     account.environments.length > 0
-      ? account.environments.map((environment) => environment.label).join(", ")
+      ? account.environments
+          .map((environment) => `${environment.label}${environment.offline ? " (offline)" : ""}`)
+          .join(", ")
       : account.sourceLabel;
   const credits =
     redeem && account.limits.resetCredits?.availableCount ? account.limits.resetCredits : null;

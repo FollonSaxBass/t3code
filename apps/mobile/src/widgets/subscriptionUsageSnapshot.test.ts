@@ -44,7 +44,11 @@ function presentations(providers: readonly ServerProvider[] = [provider()]) {
   return new Map([
     [
       EnvironmentId.make("env"),
-      { entry: { target: { label: "Remote" } }, serverConfig: { providers } },
+      {
+        entry: { target: { label: "Remote" } },
+        connection: { phase: "available" },
+        serverConfig: { providers },
+      },
     ],
   ]);
 }
@@ -70,6 +74,7 @@ describe("subscription widget snapshots", () => {
         EnvironmentId.make("env"),
         {
           entry: { target: { label: "Remote" } },
+          connection: { phase: "available" },
           serverConfig: {
             providers: [provider()],
             usageLimitSources: [
@@ -118,6 +123,7 @@ describe("subscription widget snapshots", () => {
     const input = presentations();
     input.set(EnvironmentId.make("other"), {
       entry: { target: { label: "Other" } },
+      connection: { phase: "available" },
       serverConfig: {
         providers: [
           provider({
