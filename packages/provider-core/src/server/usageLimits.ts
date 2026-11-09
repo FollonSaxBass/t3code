@@ -84,8 +84,15 @@ export function applyUsageLimitsUpdate(input: {
   if (!changed && previous !== undefined) {
     return previous;
   }
-  const unavailable =
-    previous === undefined ? { reason: "probeFailed" as const } : previous.unavailable;
+  // Session and weekly together are a complete reading, so a failed probe no longer applies.
+  const complete =
+    update.windows.some((window) => window.kind === "session") &&
+    update.windows.some((window) => window.kind === "weekly");
+  const unavailable = complete
+    ? undefined
+    : previous === undefined
+      ? { reason: "probeFailed" as const }
+      : previous.unavailable;
   return {
     ...makeUsageLimits({ checkedAt: input.checkedAt, windows: merged.values() }),
     ...(previous?.resetCredits !== undefined ? { resetCredits: previous.resetCredits } : {}),

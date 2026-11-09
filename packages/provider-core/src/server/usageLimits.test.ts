@@ -96,6 +96,20 @@ describe("applyUsageLimitsUpdate", () => {
     ).toEqual({ checkedAt, windows: [weekly], unavailable: { reason: "probeFailed" } });
   });
 
+  it("clears a failed probe once a streamed update carries session and weekly windows", () => {
+    const failed = { checkedAt, windows: [], unavailable: { reason: "probeFailed" as const } };
+    expect(
+      applyUsageLimitsUpdate({
+        previous: failed,
+        checkedAt,
+        update: { windows: [session, weekly] },
+      }),
+    ).toEqual({ checkedAt, windows: [session, weekly] });
+    expect(
+      applyUsageLimitsUpdate({ previous: failed, checkedAt, update: { windows: [weekly] } }),
+    ).toEqual({ checkedAt, windows: [weekly], unavailable: { reason: "probeFailed" } });
+  });
+
   it("preserves reset credits and a $0 cap when a streamed window update changes usage", () => {
     const resetCredits = { availableCount: 2, nextExpiresAt: "2026-10-01T00:00:00.000Z" };
     const next = applyUsageLimitsUpdate({
