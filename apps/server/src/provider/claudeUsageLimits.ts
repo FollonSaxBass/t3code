@@ -163,11 +163,25 @@ function makeWindow(
   };
 }
 
+// The CLI reports both windows here and may omit top-level utilization; not yet in the SDK typings.
+function readUnifiedWindows(info: SDKRateLimitInfo): ServerProviderUsageWindow[] {
+  const unified = (info as { readonly unifiedWindows?: unknown }).unifiedWindows;
+  if (typeof unified !== "object" || unified === null) return [];
+  return Object.keys(WINDOWS).flatMap((id) => {
+    const window = (unified as Record<string, { utilization?: unknown; resetsAt?: unknown }>)[id];
+    if (typeof window?.utilization !== "number") return [];
+    const resetsAt = typeof window.resetsAt === "number" ? window.resetsAt : undefined;
+    return [makeWindow(id, window.utilization * 100, isoFromEpochSeconds(resetsAt))];
+  });
+}
+
 /** Stream utilization is 0-1. Drop unnamed overage buckets until probed to avoid unreconcilable rows. */
 export function claudeRateLimitEventToUpdate(
   info: SDKRateLimitInfo,
   names: ClaudeScopedLimitNames,
 ): ProviderUsageLimitsUpdate | undefined {
+  const unified = readUnifiedWindows(info);
+  if (unified.length > 0) return { windows: unified };
   const type: string | undefined = info.rateLimitType;
   if (!type || typeof info.utilization !== "number") {
     return undefined;
