@@ -19,6 +19,7 @@ import { ProviderDriverError } from "@t3tools/provider-core/server/errors";
 import { buildInitialCursorProviderSnapshot, checkCursorProviderStatus } from "./status.ts";
 import * as CursorSdkCatalog from "./CursorSdkCatalog.ts";
 import { makeManagedServerProvider } from "@t3tools/provider-core/server/managedProvider";
+import { makeUsageRequestThrottle } from "@t3tools/provider-core/server/usageLimits";
 import {
   defaultProviderContinuationIdentity,
   type ProviderDriver,
@@ -211,6 +212,7 @@ export const CursorDriver: ProviderDriver<
       () => catalogModels,
     );
 
+    const usageThrottle = yield* makeUsageRequestThrottle;
     const checkProvider = auth.readApiKey.pipe(
       Effect.orElseSucceed(() => undefined),
       Effect.flatMap((apiKey) =>
@@ -230,10 +232,15 @@ export const CursorDriver: ProviderDriver<
                 snapshot.auth.status === "authenticated"
               ),
             (snapshot) =>
-              readCursorUsageLimits(effectiveConfig, {
-                ...processEnv,
-                CURSOR_API_KEY: apiKey,
-              }).pipe(Effect.map((usageLimits) => ({ ...snapshot, usageLimits }))),
+              usageThrottle
+                .read(
+                  apiKey ?? "",
+                  readCursorUsageLimits(effectiveConfig, {
+                    ...processEnv,
+                    CURSOR_API_KEY: apiKey,
+                  }),
+                )
+                .pipe(Effect.map((usageLimits) => ({ ...snapshot, usageLimits }))),
           ),
         ),
       ),

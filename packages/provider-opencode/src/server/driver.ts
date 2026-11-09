@@ -49,6 +49,7 @@ import {
   readSettledOpenCode2Catalog,
 } from "./status.ts";
 import { makeManagedServerProvider } from "@t3tools/provider-core/server/managedProvider";
+import { makeUsageRequestThrottle } from "@t3tools/provider-core/server/usageLimits";
 import * as OpenCodeRuntime from "./OpenCodeRuntime.ts";
 import {
   makeOpenCodeRuntimeProbe,
@@ -474,7 +475,8 @@ export const OpenCodeDriver: ProviderDriver<
       Effect.provideService(Digest.Digest, digest),
     );
     let unsupportedUsageVersion: string | undefined;
-    const checkUsageLimits = Effect.gen(function* () {
+    const usageThrottle = yield* makeUsageRequestThrottle;
+    const readUsageLimits = Effect.gen(function* () {
       if (!effectiveConfig.enabled) return yield* legacyUsageLimits;
       const runtime = yield* runtimeProbe.get;
       if (runtime.generation === "v1" || runtime.version === unsupportedUsageVersion)
@@ -497,6 +499,7 @@ export const OpenCodeDriver: ProviderDriver<
         })),
       ),
     );
+    const checkUsageLimits = usageThrottle.read("", readUsageLimits);
     const checkProvider = Effect.all(
       {
         // A configured loopback server reports its running version. Probe the local

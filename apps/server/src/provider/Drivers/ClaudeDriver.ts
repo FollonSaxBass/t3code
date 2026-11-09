@@ -34,6 +34,7 @@ import {
   type ClaudeCapabilitiesProbe,
 } from "../ClaudeProvider.ts";
 import { makeManagedServerProvider } from "@t3tools/provider-core/server/managedProvider";
+import { makeUsageRequestThrottle } from "@t3tools/provider-core/server/usageLimits";
 import * as ModelCatalog from "@t3tools/provider-core/server/ModelCatalog";
 import { resolveClaudeModelCatalog } from "../ClaudeModelCatalog.ts";
 import {
@@ -204,9 +205,12 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv, Path.
     // account-specific probes never share auth metadata across instances.
     // A transient miss may reuse the last account once, but its usage windows keep their age.
     const lastGoodCapabilities = yield* Ref.make<ClaudeCapabilitiesProbe | undefined>(undefined);
+    const usageThrottle = yield* makeUsageRequestThrottle;
     const capabilitiesProbeCache = yield* Cache.makeWith(
-      () =>
-        probeClaudeCapabilities(effectiveConfig, processEnv, stateDir).pipe(
+      (key: string) =>
+        probeClaudeCapabilities(effectiveConfig, processEnv, stateDir, true, (email) =>
+          usageThrottle.claim(`${key}\0${email ?? ""}`),
+        ).pipe(
           Effect.flatMap((capabilities) =>
             ClaudeResetCredits.readClaudeOrganizationId(accountConfigPath).pipe(
               Effect.map((workspaceId) => ({
@@ -378,25 +382,9 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv, Path.
             cause,
           }),
       ),
-      Effect.tap((outcome) =>
-        ResetCreditCoordinator.refreshAfterRedemption({
-          outcome,
-          getSnapshot: snapshot.getSnapshot,
-          refresh: Cache.invalidateAll(capabilitiesProbeCache).pipe(
-            Effect.andThen(snapshot.refresh),
-          ),
-        }).pipe(
-          Effect.filterOrFail(
-            (confirmed) => confirmed,
-            () =>
-              new ProviderDriverError({
-                driver: DRIVER_KIND,
-                instanceId,
-                detail:
-                  "The reset was applied, but Claude could not confirm the new limits. Refresh to check.",
-              }),
-          ),
-        ),
+      // Outside the usage request window this also shows the new limits.
+      Effect.tap(() =>
+        Cache.invalidateAll(capabilitiesProbeCache).pipe(Effect.andThen(snapshot.refresh)),
       ),
     );
 

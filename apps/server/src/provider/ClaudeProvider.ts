@@ -475,6 +475,8 @@ const probeClaudeCapabilities = (
   environment?: NodeJS.ProcessEnv,
   cwd?: string,
   includeStatus = true,
+  /** Decides per signed-in account whether this probe may request usage (five-minute throttle). */
+  claimUsage?: (email: string | undefined) => Effect.Effect<boolean>,
 ) => {
   const abort = new AbortController();
   const abortProbe = Effect.sync(() => {
@@ -527,11 +529,22 @@ const probeClaudeCapabilities = (
         // Only the rate limits are read, so skip the local transcript scan that fills
         // `behaviors`: with a few GB of transcripts it outlasts the deadline.
         // The effort caps are read in parallel under the same deadline; workspace probes skip both.
+        const account = init.account as
+          | {
+              readonly email?: string;
+              readonly subscriptionType?: string;
+              readonly tokenSource?: string;
+              readonly apiKeySource?: string;
+              readonly apiProvider?: string;
+            }
+          | undefined;
+        const readUsage =
+          includeStatus && (claimUsage === undefined || (yield* claimUsage(account?.email)));
         const usageCheckedAt = DateTime.formatIso(yield* DateTime.now);
         const { getSettings } = q as ClaudeSettingsQuery;
         const [usageResult, settingsResult] = yield* Effect.all(
           [
-            includeStatus
+            readUsage
               ? Effect.tryPromise({
                   try: () =>
                     q.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET({
@@ -561,15 +574,6 @@ const probeClaudeCapabilities = (
         const effortCapSources = parseClaudeEffortCapSources(
           settingsResult && Result.isSuccess(settingsResult) ? settingsResult.success : undefined,
         );
-        const account = init.account as
-          | {
-              readonly email?: string;
-              readonly subscriptionType?: string;
-              readonly tokenSource?: string;
-              readonly apiKeySource?: string;
-              readonly apiProvider?: string;
-            }
-          | undefined;
         return {
           email: account?.email,
           subscriptionType: account?.subscriptionType,

@@ -22,6 +22,7 @@ import {
 import { grokUsageReader } from "./usage.ts";
 import { readGrokAccount } from "./usageLimits.ts";
 import { makeManagedServerProvider } from "@t3tools/provider-core/server/managedProvider";
+import { makeUsageRequestThrottle } from "@t3tools/provider-core/server/usageLimits";
 import {
   defaultProviderContinuationIdentity,
   type ProviderDriver,
@@ -183,6 +184,7 @@ export const GrokDriver: ProviderDriver<GrokSettings, GrokDriverEnv, Path.Path> 
     );
     const textGeneration = yield* makeGrokTextGeneration(effectiveConfig, processEnv);
 
+    const usageThrottle = yield* makeUsageRequestThrottle;
     const checkProvider = checkGrokProviderStatus(effectiveConfig, processEnv, cwd).pipe(
       Effect.filterOrElse(
         (snapshot) =>
@@ -192,7 +194,7 @@ export const GrokDriver: ProviderDriver<GrokSettings, GrokDriverEnv, Path.Path> 
             snapshot.auth.status === "authenticated"
           ),
         (snapshot) =>
-          readGrokAccount(processEnv).pipe(
+          readGrokAccount(processEnv, usageThrottle).pipe(
             Effect.map(({ email, usageLimits }) => ({
               ...snapshot,
               auth: email ? { ...snapshot.auth, email } : snapshot.auth,

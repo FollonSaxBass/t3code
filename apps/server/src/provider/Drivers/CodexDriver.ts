@@ -28,12 +28,14 @@ import { ProviderDriverError } from "../Errors.ts";
 import * as ResetCreditCoordinator from "../resetCreditCoordinator.ts";
 import {
   checkCodexProviderStatus,
+  probeCodexAppServerProvider,
   makePendingCodexProvider,
   probeCodexSkillsForCwd,
   withCodexAppServerClient,
 } from "../CodexProvider.ts";
 import { resolveCodexLaunchArgs } from "../codexLaunchArgs.ts";
 import { makeManagedServerProvider } from "@t3tools/provider-core/server/managedProvider";
+import { makeUsageRequestThrottle } from "@t3tools/provider-core/server/usageLimits";
 import * as ModelCatalog from "@t3tools/provider-core/server/ModelCatalog";
 import { applyCodexModelCatalog } from "../codexModelCatalog.ts";
 import type { ProviderDriver, ProviderInstance } from "@t3tools/provider-core/server/driver";
@@ -266,12 +268,24 @@ export const CodexDriver: ProviderDriver<
       ),
     );
 
+    const usageThrottle = yield* makeUsageRequestThrottle;
     // Kick the TTL-gated manifest refresh in the background and classify with the in-memory
     // manifest, so a slow or hung fetch never delays the provider check.
     const checkProvider = modelCatalog.refreshInBackground.pipe(
       Effect.andThen(
         Effect.zipWith(
-          checkCodexProviderStatus(effectiveConfig, undefined, processEnv),
+          checkCodexProviderStatus(
+            effectiveConfig,
+            (input) =>
+              probeCodexAppServerProvider({
+                ...input,
+                claimUsage: (account) =>
+                  usageThrottle.claim(
+                    `${effectiveConfig.binaryPath}\0${input.homePath ?? ""}\0${account}`,
+                  ),
+              }),
+            processEnv,
+          ),
           currentCatalog,
           (draft, catalog) => stampIdentity(applyCodexModelCatalog(draft, catalog)),
           { concurrent: true },
@@ -382,24 +396,8 @@ export const CodexDriver: ProviderDriver<
                 cause,
               }),
           ),
-          Effect.tap((outcome) =>
-            ResetCreditCoordinator.refreshAfterRedemption({
-              outcome,
-              getSnapshot: snapshot.getSnapshot,
-              refresh: snapshot.refresh,
-            }).pipe(
-              Effect.filterOrFail(
-                (confirmed) => confirmed,
-                () =>
-                  new ProviderDriverError({
-                    driver: DRIVER_KIND,
-                    instanceId,
-                    detail:
-                      "The reset was applied, but Codex could not confirm the new limits. Refresh to check.",
-                  }),
-              ),
-            ),
-          ),
+          // Outside the usage request window this also shows the new limits.
+          Effect.tap(() => snapshot.refresh),
         );
 
     // `codex login` and `codex logout` rewrite auth.json outside T3.

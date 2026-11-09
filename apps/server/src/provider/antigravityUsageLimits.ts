@@ -13,6 +13,7 @@ import { FetchHttpClient, HttpClient, HttpClientRequest, HttpClientResponse } fr
 import {
   makeUnavailableUsageLimits,
   makeUsageLimits,
+  makeUsageRequestThrottle,
 } from "@t3tools/provider-core/server/usageLimits";
 
 export function antigravityUserAgent(platform: NodeJS.Platform, architecture: NodeJS.Architecture) {
@@ -223,6 +224,15 @@ export const makeAntigravityUsageProbe = Effect.fn("makeAntigravityUsageProbe")(
     | undefined;
   let generation = 0;
 
+  const usageThrottle = yield* makeUsageRequestThrottle;
+  const failedRead = Effect.map(DateTime.now, (now) =>
+    makeUnavailableUsageLimits({
+      checkedAt: DateTime.formatIso(now),
+      reason: "probeFailed",
+      message: "Could not read Antigravity limits. Refresh provider status to retry.",
+    }),
+  );
+
   const request = (request: HttpClientRequest.HttpClientRequest) =>
     client.execute(request).pipe(
       Effect.provideService(FetchHttpClient.RequestInit, MANUAL_REDIRECT),
@@ -238,6 +248,7 @@ export const makeAntigravityUsageProbe = Effect.fn("makeAntigravityUsageProbe")(
     }
     if (!(yield* fs.exists(tokenPath))) {
       cached = undefined;
+      yield* usageThrottle.reset;
       return makeUnavailableUsageLimits({
         checkedAt,
         reason: "unsupported",
@@ -248,114 +259,114 @@ export const makeAntigravityUsageProbe = Effect.fn("makeAntigravityUsageProbe")(
     const fingerprint = yield* sha256(
       `${token.client_id}\0${token.refresh_token}\0${token.project_id ?? ""}`,
     );
-    const now = yield* Clock.currentTimeMillis;
-    let accessToken: string;
-    let account: string;
-    if (cached?.fingerprint !== fingerprint || cached.expiresAt <= now + 60_000) {
-      cached = undefined;
-      const refreshed = yield* request(
-        HttpClientRequest.post("https://oauth2.googleapis.com/token").pipe(
-          HttpClientRequest.bodyUrlParams({
-            client_id: token.client_id,
-            client_secret: token.client_secret,
-            refresh_token: token.refresh_token,
-            grant_type: "refresh_token",
-          }),
-        ),
-      ).pipe(Effect.flatMap(decodeTokenResponse));
-      accessToken = refreshed.access_token;
-      // Use Google account IDs to merge accounts across environments; refresh tokens differ per machine.
-      account = yield* request(
-        HttpClientRequest.get("https://www.googleapis.com/oauth2/v2/userinfo").pipe(
-          HttpClientRequest.setHeaders({ Authorization: `Bearer ${accessToken}` }),
-        ),
-      ).pipe(
-        Effect.flatMap(antigravityAccountFingerprint),
-        Effect.orElseSucceed(() => fingerprint),
-      );
-      if (generation === startedGeneration) {
-        cached = {
-          fingerprint,
-          account,
-          accessToken,
-          expiresAt: now + refreshed.expires_in * 1000,
-        };
-      }
-    } else {
-      accessToken = cached.accessToken;
-      account = cached.account;
-    }
     const endpoints = ENDPOINTS[input.authMethod];
-    // Merge endpoints because quota groups differ; the metered host's reading of a bucket wins.
-    const fetchWindows = Effect.fn("AntigravityUsageProbe.fetchWindows")(function* <E>(
-      operation: string,
-      parse: (
-        response: unknown,
-        requestedAt: number,
-      ) => Effect.Effect<ServerProviderUsageWindow[], E>,
-    ) {
-      const responses = yield* Effect.forEach(
-        endpoints,
-        (endpoint) =>
-          Effect.gen(function* () {
-            // Capture each request after auth, so refresh latency does not widen the tolerance.
-            const requestedAt = yield* Clock.currentTimeMillis;
-            return yield* request(
-              HttpClientRequest.post(`${endpoint}/v1internal:${operation}`).pipe(
-                HttpClientRequest.setHeaders({
-                  Authorization: `Bearer ${accessToken}`,
-                  "User-Agent": antigravityUserAgent(platform, architecture),
-                }),
-                HttpClientRequest.bodyJsonUnsafe(
-                  token.project_id ? { project: token.project_id } : {},
-                ),
-              ),
-            ).pipe(
-              Effect.flatMap((response) => parse(response, requestedAt)),
-              Effect.orElseSucceed(() => []),
+    return yield* usageThrottle.read(
+      fingerprint,
+      Effect.gen(function* () {
+        const now = yield* Clock.currentTimeMillis;
+        let accessToken: string;
+        let account: string;
+        if (cached?.fingerprint !== fingerprint || cached.expiresAt <= now + 60_000) {
+          cached = undefined;
+          const refreshed = yield* request(
+            HttpClientRequest.post("https://oauth2.googleapis.com/token").pipe(
+              HttpClientRequest.bodyUrlParams({
+                client_id: token.client_id,
+                client_secret: token.client_secret,
+                refresh_token: token.refresh_token,
+                grant_type: "refresh_token",
+              }),
+            ),
+          ).pipe(Effect.flatMap(decodeTokenResponse));
+          accessToken = refreshed.access_token;
+          // Use Google account IDs to merge accounts across environments; refresh tokens differ per machine.
+          account = yield* request(
+            HttpClientRequest.get("https://www.googleapis.com/oauth2/v2/userinfo").pipe(
+              HttpClientRequest.setHeaders({ Authorization: `Bearer ${accessToken}` }),
+            ),
+          ).pipe(
+            Effect.flatMap(antigravityAccountFingerprint),
+            Effect.orElseSucceed(() => fingerprint),
+          );
+          if (generation === startedGeneration) {
+            cached = {
+              fingerprint,
+              account,
+              accessToken,
+              expiresAt: now + refreshed.expires_in * 1000,
+            };
+          }
+        } else {
+          accessToken = cached.accessToken;
+          account = cached.account;
+        }
+        // Merge endpoints because quota groups differ; the metered host's reading of a bucket wins.
+        const fetchWindows = Effect.fn("AntigravityUsageProbe.fetchWindows")(function* <E>(
+          operation: string,
+          parse: (
+            response: unknown,
+            requestedAt: number,
+          ) => Effect.Effect<ServerProviderUsageWindow[], E>,
+        ) {
+          const responses = yield* Effect.forEach(
+            endpoints,
+            (endpoint) =>
+              Effect.gen(function* () {
+                // Capture each request after auth, so refresh latency does not widen the tolerance.
+                const requestedAt = yield* Clock.currentTimeMillis;
+                return yield* request(
+                  HttpClientRequest.post(`${endpoint}/v1internal:${operation}`).pipe(
+                    HttpClientRequest.setHeaders({
+                      Authorization: `Bearer ${accessToken}`,
+                      "User-Agent": antigravityUserAgent(platform, architecture),
+                    }),
+                    HttpClientRequest.bodyJsonUnsafe(
+                      token.project_id ? { project: token.project_id } : {},
+                    ),
+                  ),
+                ).pipe(
+                  Effect.flatMap((response) => parse(response, requestedAt)),
+                  Effect.orElseSucceed(() => []),
+                );
+              }),
+            { concurrency: "unbounded" },
+          );
+          const windows = new Map<string, ServerProviderUsageWindow>();
+          for (const window of responses.flat()) {
+            if (!windows.has(window.id)) windows.set(window.id, window);
+          }
+          return [...windows.values()];
+        });
+        const summary = yield* fetchWindows("retrieveUserQuotaSummary", antigravitySummaryWindows);
+        const windows = summary.length
+          ? summary
+          : yield* fetchWindows("fetchAvailableModels", (response) =>
+              decodeModels(response).pipe(Effect.map(modelWindows)),
             );
-          }),
-        { concurrency: "unbounded" },
-      );
-      const windows = new Map<string, ServerProviderUsageWindow>();
-      for (const window of responses.flat()) {
-        if (!windows.has(window.id)) windows.set(window.id, window);
-      }
-      return [...windows.values()];
-    });
-    const summary = yield* fetchWindows("retrieveUserQuotaSummary", antigravitySummaryWindows);
-    const windows = summary.length
-      ? summary
-      : yield* fetchWindows("fetchAvailableModels", (response) =>
-          decodeModels(response).pipe(Effect.map(modelWindows)),
-        );
-    if (windows.length === 0) {
-      return makeUnavailableUsageLimits({
-        checkedAt,
-        reason: "probeFailed",
-        message: "Antigravity did not return usable quota information.",
-      });
-    }
-    return { ...makeUsageLimits({ checkedAt, windows }), credentialFingerprint: account };
+        if (windows.length === 0) {
+          return makeUnavailableUsageLimits({
+            checkedAt,
+            reason: "probeFailed",
+            message: "Antigravity did not return usable quota information.",
+          });
+        }
+        return { ...makeUsageLimits({ checkedAt, windows }), credentialFingerprint: account };
+      }).pipe(
+        Effect.timeout("30 seconds"),
+        Effect.catch(() => failedRead),
+      ),
+    );
   });
   const probe = read.pipe(
     Effect.provideService(Digest.Digest, crypto),
     Effect.timeout("30 seconds"),
-    Effect.catch(() =>
-      Effect.gen(function* () {
-        return makeUnavailableUsageLimits({
-          checkedAt: DateTime.formatIso(yield* DateTime.now),
-          reason: "probeFailed",
-          message: "Could not read Antigravity limits. Refresh provider status to retry.",
-        });
-      }),
-    ),
+    Effect.catch(() => failedRead),
   );
   return {
     probe,
     clear: Effect.sync(() => {
       cached = undefined;
       generation++;
-    }),
+    }).pipe(Effect.andThen(usageThrottle.reset)),
   };
 });

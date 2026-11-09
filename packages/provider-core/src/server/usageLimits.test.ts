@@ -1,6 +1,13 @@
+import { it as effectIt } from "@effect/vitest";
+import * as Effect from "effect/Effect";
+import * as TestClock from "effect/testing/TestClock";
 import { describe, expect, it } from "vite-plus/test";
 
-import { applyUsageLimitsUpdate, resolveUsageLimitsAfterProbe } from "./usageLimits.ts";
+import {
+  applyUsageLimitsUpdate,
+  makeUsageRequestThrottle,
+  resolveUsageLimitsAfterProbe,
+} from "./usageLimits.ts";
 
 const checkedAt = "2026-09-03T12:00:00.000Z";
 const session = {
@@ -143,4 +150,41 @@ describe("resolveUsageLimitsAfterProbe", () => {
     expect(resolveUsageLimitsAfterProbe({ published, probed: unsupported })).toBe(unsupported);
     expect(resolveUsageLimitsAfterProbe({ published: undefined, probed: failed })).toBe(failed);
   });
+});
+
+describe("makeUsageRequestThrottle", () => {
+  effectIt.effect(
+    "requests one account's usage at most every five minutes, failures included",
+    () =>
+      Effect.gen(function* () {
+        const throttle = yield* makeUsageRequestThrottle;
+        let requests = 0;
+        const request = (outcome: "ok" | "429") =>
+          Effect.suspend(() => {
+            requests++;
+            return outcome === "ok" ? Effect.succeed(published) : Effect.fail("429" as const);
+          });
+
+        expect(yield* throttle.read("account-a", request("ok"))).toBe(published);
+        yield* TestClock.adjust("4 minutes");
+        expect(yield* throttle.read("account-a", request("ok"))).toBe(published);
+        expect(requests).toBe(1);
+        // Another account has its own budget.
+        yield* throttle.read("account-b", request("ok"));
+        expect(requests).toBe(2);
+
+        yield* TestClock.adjust("5 minutes");
+        expect(yield* Effect.flip(throttle.read("account-b", request("429")))).toBe("429");
+        const reused = yield* throttle.read("account-b", request("ok"));
+        expect(reused.unavailable?.reason).toBe("probeFailed");
+        expect(yield* throttle.claim("account-b")).toBe(false);
+        expect(requests).toBe(3);
+
+        yield* TestClock.adjust("5 minutes");
+        expect(yield* throttle.claim("account-b")).toBe(true);
+        yield* throttle.reset;
+        expect(yield* throttle.read("account-b", request("ok"))).toBe(published);
+        expect(requests).toBe(4);
+      }),
+  );
 });

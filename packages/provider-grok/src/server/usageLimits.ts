@@ -12,6 +12,7 @@ import {
   clampPercent,
   makeUnavailableUsageLimits,
   makeUsageLimits,
+  type UsageRequestThrottle,
 } from "@t3tools/provider-core/server/usageLimits";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 
@@ -160,6 +161,7 @@ const readGrokCredential = Effect.fn("readGrokCredential")(function* (
 
 export const readGrokAccount = Effect.fn("readGrokAccount")(function* (
   environment: NodeJS.ProcessEnv = process.env,
+  throttle?: Pick<UsageRequestThrottle, "read">,
 ) {
   const checkedAt = DateTime.formatIso(yield* DateTime.now);
   const probeFailed = makeUnavailableUsageLimits({
@@ -176,7 +178,7 @@ export const readGrokAccount = Effect.fn("readGrokAccount")(function* (
   if (!token) {
     return { email, usageLimits: makeUnavailableUsageLimits({ checkedAt, reason: "unsupported" }) };
   }
-  const usageLimits = yield* Effect.gen(function* () {
+  const request = Effect.gen(function* () {
     const client = yield* HttpClient.HttpClient;
     const response = yield* client.execute(
       HttpClientRequest.get(GROK_USAGE_URL).pipe(HttpClientRequest.bearerToken(token)),
@@ -200,5 +202,6 @@ export const readGrokAccount = Effect.fn("readGrokAccount")(function* (
     Effect.timeout("10 seconds"),
     Effect.orElseSucceed(() => probeFailed),
   );
+  const usageLimits = yield* throttle ? throttle.read(email ?? "", request) : request;
   return { email, usageLimits };
 });

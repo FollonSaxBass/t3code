@@ -709,6 +709,8 @@ const probeCodexAppServerProvider = Effect.fn("probeCodexAppServerProvider")(fun
   readonly cwd: string;
   readonly environment?: NodeJS.ProcessEnv;
   readonly skipNativeUsage?: boolean;
+  /** Decides per signed-in account whether this probe may read rate limits. */
+  readonly claimUsage?: (account: string) => Effect.Effect<boolean>;
 }) {
   const spawnedAtMs = DateTime.toEpochMillis(yield* DateTime.now);
   const { client, initialize } = yield* withCodexAppServerClient(input);
@@ -725,6 +727,9 @@ const probeCodexAppServerProvider = Effect.fn("probeCodexAppServerProvider")(fun
       skills: [],
     } satisfies CodexAppServerProviderSnapshot;
   }
+
+  const usageAccount =
+    codexAccountEmail(accountResponse.account) ?? accountResponse.account?.type ?? "";
 
   // Optional discovery must finish before the outer timeout can discard the account result.
   const deadlineMs = spawnedAtMs + input.probeTimeoutMs - CODEX_DISCOVERY_MARGIN_MS;
@@ -752,8 +757,13 @@ const probeCodexAppServerProvider = Effect.fn("probeCodexAppServerProvider")(fun
             !input.skipNativeUsage &&
             config !== undefined &&
             codexRoutesSpendNativeQuota(accountResponse, config.config);
+          // A throttled native route keeps its last published reading.
           const readUsage: Effect.Effect<CodexRateLimitsProbe | undefined> = nativeUsage
-            ? readCodexRateLimits(client, deadlineMs)
+            ? (input.claimUsage?.(usageAccount) ?? Effect.succeed(true)).pipe(
+                Effect.flatMap((claimed) =>
+                  claimed ? readCodexRateLimits(client, deadlineMs) : Effect.undefined,
+                ),
+              )
             : Effect.undefined;
           return readUsage.pipe(
             Effect.map((rateLimits) => ({
@@ -1103,4 +1113,4 @@ export const checkCodexProviderStatus = Effect.fn("checkCodexProviderStatus")(fu
   });
 });
 
-export { makePendingCodexProvider };
+export { makePendingCodexProvider, probeCodexAppServerProvider };

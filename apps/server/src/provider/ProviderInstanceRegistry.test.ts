@@ -767,15 +767,17 @@ describe("ProviderInstanceRegistry — multi-instance codex slice", () => {
       Effect.provide(layerTest),
     );
 
-  it.live.skipIf(windowsHost)("refreshes Claude usage after redeeming a reset", () =>
-    Effect.gen(function* () {
-      const { outcome, after } = yield* redeemClaudeReset({
-        result: "reset",
-        usageFailsAfterClaim: false,
-      });
-      expect(outcome).toMatchObject({ _tag: "Success", success: "reset" });
-      expect(after.usageLimits?.windows[0]?.usedPercent).toBe(0);
-    }),
+  it.live.skipIf(windowsHost)(
+    "redeems a Claude reset without a second usage read inside the request window",
+    () =>
+      Effect.gen(function* () {
+        const { outcome, after } = yield* redeemClaudeReset({
+          result: "reset",
+          usageFailsAfterClaim: false,
+        });
+        expect(outcome).toMatchObject({ _tag: "Success", success: "reset" });
+        expect(after.usageLimits?.windows[0]?.usedPercent).toBe(100);
+      }),
   );
 
   it.live.skipIf(windowsHost)(
@@ -841,7 +843,7 @@ describe("ProviderInstanceRegistry — multi-instance codex slice", () => {
     it.effect.skipIf(windowsHost)(
       state === "signed-out"
         ? "shows Claude usage on the first refresh after signing back in"
-        : "retries Claude usage on the first refresh after a failed usage read",
+        : "retries Claude usage five minutes after a failed usage read, not before",
       () =>
         Effect.gen(function* () {
           const fixture = yield* makeClaudeCacheFixture(state);
@@ -855,6 +857,12 @@ describe("ProviderInstanceRegistry — multi-instance codex slice", () => {
           }
 
           yield* fixture.recover;
+          if (state === "usage-failed") {
+            // The failed read spent this account's usage request for five minutes.
+            const throttled = yield* fixture.refresh;
+            expect(throttled.usageLimits?.unavailable?.reason).toBe("probeFailed");
+            yield* TestClock.adjust("5 minutes");
+          }
           const after = yield* fixture.refresh;
           expect(after.auth.status).toBe("authenticated");
           expect(after.usageLimits?.unavailable).toBeUndefined();

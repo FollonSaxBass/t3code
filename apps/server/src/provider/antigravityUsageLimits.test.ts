@@ -438,6 +438,7 @@ describe("Antigravity subscription limits", () => {
       });
       expect(byId.get("3p-5h")).toMatchObject({ kind: "session", windowDurationMins: 300 });
       expect(byId.get("3p-5h")?.usedPercent).toBeCloseTo(56);
+      yield* TestClock.adjust("5 minutes");
       yield* probe;
       expect(requests.filter((request) => request.url.endsWith("/token"))).toHaveLength(1);
       expect(
@@ -575,6 +576,22 @@ describe("Antigravity subscription limits", () => {
       yield* clear;
       yield* probe;
       expect(requests.filter((request) => request.url.endsWith("/token"))).toHaveLength(4);
+    }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+  );
+
+  it.effect("reads one account's quota at most every five minutes, failures included", () =>
+    Effect.gen(function* () {
+      const { probe, requests } = yield* fixture({ summaryStatus: 429 });
+      const quotaReads = () =>
+        requests.filter((request) => request.url.endsWith(":retrieveUserQuotaSummary")).length;
+      expect((yield* probe).unavailable?.reason).toBe("probeFailed");
+      const failedReads = quotaReads();
+      yield* TestClock.adjust("4 minutes");
+      expect((yield* probe).unavailable?.reason).toBe("probeFailed");
+      expect(quotaReads()).toBe(failedReads);
+      yield* TestClock.adjust("1 minute");
+      yield* probe;
+      expect(quotaReads()).toBe(failedReads * 2);
     }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
   );
 
