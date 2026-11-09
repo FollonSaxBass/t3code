@@ -3200,7 +3200,16 @@ export const layerWithOptions = (
                     .filter((thread) => thread.providerSessionId === input.providerSessionId)
                     .map((thread) => [thread.id, thread] as const),
                 );
-                detachedProviderThreads = [...providerThreads.values()];
+                // An account change rebinds the projected thread before this detach runs;
+                // the native writer still lives here until this session unloads it.
+                const loaded = currentEntry.idleThreadUnloads.get(input.threadId)?.providerThread;
+                const reboundAway =
+                  loaded !== undefined &&
+                  !providerThreads.has(loaded.id) &&
+                  projection.value.providerThreads.some((thread) => thread.id === loaded.id);
+                detachedProviderThreads = reboundAway
+                  ? [...providerThreads.values(), loaded]
+                  : [...providerThreads.values()];
                 const activeTurns = projection.value.providerTurns.filter(
                   (turn) => turn.status === "running" && providerThreads.has(turn.providerThreadId),
                 );

@@ -3730,12 +3730,16 @@ describe("CodexAdapterV2 post-settle continuation", () => {
           ],
         }),
       );
-      yield* harness.runtime.unloadThread!({ providerThread: harness.providerThread });
+      // Unload waits for thread/closed, which this transcript sends only after the resume.
+      const unload = yield* harness.runtime.unloadThread!({
+        providerThread: harness.providerThread,
+      }).pipe(Effect.forkChild({ startImmediately: true }));
       const resumed = yield* harness.runtime.resumeThread({
         providerThread: harness.providerThread,
         modelSelection: CODEX_TEST_MODEL_SELECTION,
         runtimePolicy: CODEX_TEST_RUNTIME_POLICY,
       });
+      yield* Fiber.join(unload);
       assert.equal(resumed.nativeThreadRef?.nativeId, nativeThreadId);
       assert.equal(resumed.status, "idle");
     }).pipe(
@@ -5486,6 +5490,79 @@ describe("CodexAdapterV2 post-settle continuation", () => {
         ),
       ),
     ),
+  );
+
+  it.effect.each(["before-reply", "after-reply"] as const)(
+    "waits for the native writer to close on unsubscribe (%s)",
+    (closedOrder) =>
+      Effect.gen(function* () {
+        const nativeThreadId = "account-handoff";
+        const closedPending = yield* Deferred.make<void>();
+        const releaseClosed = yield* Deferred.make<void>();
+        const closed: CodexReplay.CodexAppServerReplayEntry = {
+          type: "emit_inbound",
+          label: "native-closed",
+          frame: { method: "thread/closed", params: { threadId: nativeThreadId } },
+        };
+        const reply: CodexReplay.CodexAppServerReplayEntry = {
+          type: "emit_inbound",
+          label: "unsubscribe-reply",
+          frame: { id: 3, result: { status: "unsubscribed" } },
+        };
+        const harness = yield* makeCodexReplayHarness(
+          makeCodexReplayTranscript({
+            scenario: `account-handoff-${closedOrder}`,
+            entries: [
+              ...codexReplayPreamble({
+                nativeThreadId,
+                nativeTurnId: "unused",
+                prompt: "unused",
+              }).slice(0, 5),
+              {
+                type: "expect_outbound",
+                frame: {
+                  id: 3,
+                  method: "thread/unsubscribe",
+                  params: { threadId: nativeThreadId },
+                },
+              },
+              {
+                type: "emit_inbound",
+                frame: { method: "thread/closed", params: { threadId: "another-thread" } },
+              },
+              ...(closedOrder === "before-reply" ? [closed, reply] : [reply, closed]),
+            ],
+          }),
+          undefined,
+          undefined,
+          undefined,
+          (entry) =>
+            entry.label === "native-closed"
+              ? Deferred.succeed(closedPending, undefined).pipe(
+                  Effect.andThen(Deferred.await(releaseClosed)),
+                )
+              : Effect.void,
+        );
+        const unload = yield* harness.runtime.unloadThread!({
+          providerThread: harness.providerThread,
+        }).pipe(Effect.forkChild({ startImmediately: true }));
+        yield* Deferred.await(closedPending);
+        // Drain runnable fibers while the actual close notification is held back.
+        yield* TestClock.adjust(0);
+        assert.isUndefined(unload.pollUnsafe(), "unsubscribe alone must not release the writer");
+        yield* Deferred.succeed(releaseClosed, undefined);
+        yield* Fiber.join(unload);
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          Layer.mergeAll(
+            IdAllocator.layer,
+            McpProviderSessions.layer,
+            NodeServices.layer,
+            NodeCrypto.layer,
+          ),
+        ),
+      ),
   );
 
   it.effect.each([false, true])(
@@ -9739,6 +9816,11 @@ describe("CodexAdapterV2 post-settle continuation", () => {
                     type: "emit_inbound",
                     label: "thread/unsubscribe",
                     frame: { id: 5, result: { status: "unsubscribed" } },
+                  },
+                  {
+                    type: "emit_inbound",
+                    label: "thread/closed",
+                    frame: { method: "thread/closed", params: { threadId: nativeThreadId } },
                   },
                 ] satisfies Array<CodexReplay.CodexAppServerReplayEntry>)
               : ([

@@ -5235,6 +5235,73 @@ it.effect.each([
 );
 
 it.effect(
+  "ProviderSessionManagerV2 unloads a loaded thread already rebound to another account's session",
+  () =>
+    Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      yield* Effect.gen(function* () {
+        const eventSink = yield* EventSink.EventSinkV2;
+        const idAllocator = yield* IdAllocator.IdAllocatorV2;
+        const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+        const now = yield* DateTime.now;
+        const projectId = yield* idAllocator.allocate.project({
+          fixtureName: "provider-session-manager-account-rebind",
+        });
+        const threadId = yield* idAllocator.allocate.thread({
+          fixtureName: "provider-session-manager-account-rebind",
+          projectId,
+        });
+        const providerSessionId = idAllocator.derive.providerSession({
+          providerInstanceId: modelSelection.instanceId,
+        });
+        const nextSessionId = idAllocator.derive.providerSession({
+          providerInstanceId: ProviderInstanceId.make("codex-other-account"),
+        });
+        const providerThread = makeProviderThread({
+          idAllocator,
+          threadId,
+          providerSessionId,
+          now,
+        });
+        const providerThreadUpdated = (payload: OrchestrationV2ProviderThread) =>
+          Effect.gen(function* () {
+            return {
+              id: yield* idAllocator.allocate.event({ threadId }),
+              type: "provider-thread.updated" as const,
+              threadId,
+              driver: CODEX_DRIVER,
+              occurredAt: now,
+              payload,
+            };
+          });
+        yield* eventSink.write({
+          events: [
+            yield* makeThreadCreatedEvent({ idAllocator, threadId, now }),
+            yield* providerThreadUpdated(providerThread),
+          ],
+        });
+        const runtime = yield* manager.open({
+          threadId,
+          providerSessionId,
+          modelSelection,
+          runtimePolicy,
+        });
+        yield* runtime.resumeThread({ providerThread, threadId, modelSelection, runtimePolicy });
+
+        // The account-change command commits the rebinding before the old session's detach runs.
+        yield* eventSink.write({
+          events: [
+            yield* providerThreadUpdated({ ...providerThread, providerSessionId: nextSessionId }),
+          ],
+        });
+        yield* manager.detach({ providerSessionId, threadId });
+
+        assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, ["native-thread"]);
+      }).pipe(Effect.provide(layerTest({ state, idleTimeoutMs: 1000 })), Effect.scoped);
+    }),
+);
+
+it.effect(
   "ProviderSessionManagerV2 re-attaching a thread waits for its in-flight unload, then reloads it",
   () =>
     Effect.gen(function* () {
