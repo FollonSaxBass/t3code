@@ -2198,6 +2198,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           ProviderAdapter.ProviderAdapterV2Event,
           ProviderAdapter.ProviderAdapterEventStreamError
         >();
+        const threadCloseWaiters = new Map<string, Set<Deferred.Deferred<void>>>();
         const initialized = yield* Ref.make(false);
         // After a timeout the session is retiring; waiters must not re-send to the hung app-server.
         const initializeTimeout = yield* Ref.make<
@@ -5690,6 +5691,9 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               });
               yield* releaseSettledTurnIfIdle(context.nativeTurnId);
             }
+            for (const waiter of threadCloseWaiters.get(payload.threadId) ?? []) {
+              yield* Deferred.succeed(waiter, undefined);
+            }
           }).pipe(Effect.orDie, turnTerminalizationPermit.withPermits(1)),
         );
 
@@ -8638,6 +8642,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           }),
           // Dropping this connection's subscription lets the shared app-server
           // shut the native thread (and its MCP servers) down once it is idle.
+          // Unload returns only after that native closure (account handoff).
           unloadThread: Effect.fn("CodexAdapterV2.unloadThread")(
             function* (unloadInput) {
               const nativeThreadId = yield* getNativeThreadId(unloadInput.providerThread);
@@ -8651,7 +8656,23 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 if (!threadClosings.has(nativeThreadId)) {
                   threadClosings.set(nativeThreadId, yield* Deferred.make<void>());
                 }
-                yield* client.request("thread/unsubscribe", { threadId: nativeThreadId });
+                // Another account's app-server may resume this thread next, so wait for
+                // thread/closed: the unsubscribe reply alone does not release the writer.
+                const closed = yield* Deferred.make<void>();
+                const waiters = threadCloseWaiters.get(nativeThreadId) ?? new Set();
+                waiters.add(closed);
+                threadCloseWaiters.set(nativeThreadId, waiters);
+                yield* client.request("thread/unsubscribe", { threadId: nativeThreadId }).pipe(
+                  Effect.flatMap((reply) =>
+                    reply.status === "unsubscribed" ? Deferred.await(closed) : Effect.void,
+                  ),
+                  Effect.ensuring(
+                    Effect.sync(() => {
+                      waiters.delete(closed);
+                      if (waiters.size === 0) threadCloseWaiters.delete(nativeThreadId);
+                    }),
+                  ),
+                );
               }
               // No turn/completed arrives for an unloaded thread, so a Stop Codex never
               // confirmed would otherwise keep its turn open for the life of the session.
