@@ -182,6 +182,12 @@ export const OrchestratorMcpDelegateTaskInput = Schema.Struct({
         "'shared' (default): parent checkout. 'worktree': new prepared checkout from the parent commit, for a separate checkout or PR per child. Uncommitted edits stay out.",
     }),
   ),
+  checkout: Schema.optional(
+    TrimmedNonEmptyString.check(Schema.isMaxLength(4096)).annotate({
+      description:
+        "Absolute path of an existing clean Git checkout root for the child: inside this project's folder, one of its worktrees, or a configured root. Not with `isolation:'worktree'`.",
+    }),
+  ),
   mode: Schema.optional(
     Schema.Literals(["async", "wait"]).annotate({
       description:

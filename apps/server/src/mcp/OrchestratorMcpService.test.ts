@@ -36,9 +36,11 @@ import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Path from "effect/Path";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Result from "effect/Result";
@@ -65,6 +67,8 @@ import {
 import * as ProviderAdapterRegistry from "../orchestration-v2/ProviderAdapterRegistry.ts";
 import * as ThreadLaunchService from "../orchestration-v2/ThreadLaunchService.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
+import * as VcsProcess from "../vcs/VcsProcess.ts";
+import * as ServerConfig from "../config.ts";
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
 import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
 import { buildUnavailableProviderSnapshot } from "../provider/unavailableProviderSnapshot.ts";
@@ -3174,6 +3178,152 @@ describe("OrchestratorMcpService provider resolution", () => {
           assert.deepEqual(yield* Ref.get(wakePolicies), mode === "wait" ? ["always"] : []);
         }).pipe(Effect.provide(layerService.pipe(Layer.provide(layerDependencies))));
       }),
+  );
+
+  it.effect(
+    "a task runs in a named checkout only when it is a clean checkout root the project allows",
+    () =>
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const root = yield* fileSystem.realPath(
+          yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-delegate-checkout-" }),
+        );
+        const project = path.join(root, "project");
+        const clone = path.join(project, "projects", "other");
+        const review = path.join(clone, ".worktrees", "review");
+        const sibling = path.join(root, "sibling");
+        const outside = path.join(root, "outside");
+        const configured = path.join(root, "clones", "configured");
+        const gitLayer = GitVcsDriver.layer.pipe(
+          Layer.provideMerge(VcsProcess.layer),
+          Layer.provideMerge(
+            ServerConfig.layerTest(process.cwd(), { prefix: "t3-delegate-checkout-" }).pipe(
+              Layer.provide(NodeServices.layer),
+            ),
+          ),
+          Layer.provideMerge(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
+        );
+        const git = yield* GitVcsDriver.GitVcsDriver.pipe(Effect.provide(gitLayer));
+        const run = (cwd: string, ...args: ReadonlyArray<string>) =>
+          git.execute({ operation: "test.setupRepo", cwd, args });
+        const commit = ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"];
+        for (const repo of [project, clone, outside, configured]) {
+          yield* fileSystem.makeDirectory(repo, { recursive: true });
+          yield* run(repo, "init", "-q", "-b", "main");
+          yield* fileSystem.writeFileString(path.join(repo, "tracked.txt"), "one\n");
+          yield* run(repo, "add", "tracked.txt");
+          yield* run(repo, ...commit);
+        }
+        yield* run(clone, "worktree", "add", "-q", "--detach", review);
+        yield* run(project, "worktree", "add", "-q", "-b", "feature", sibling);
+        yield* fileSystem.writeFileString(path.join(review, "untracked.txt"), "context\n");
+
+        const dispatched: Array<unknown> = [];
+        const task = {
+          id: taskId,
+          threadId: parentThreadId,
+          origin: "app_owned",
+          childThreadId,
+          providerInstanceId: codexInstanceId,
+          model: "gpt-5.4",
+          status: "running",
+          result: null,
+        };
+        const service = OrchestratorMcpService.layer.pipe(
+          Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
+          Layer.provide(gitLayer),
+          Layer.provide(
+            Layer.mergeAll(
+              NodeServices.layer,
+              NodeCrypto.layer,
+              Layer.mock(ThreadManagementService.ThreadManagementService)({
+                hasReceipt: () => Effect.succeed(false),
+                getThreadRecords: (threadId) =>
+                  Effect.succeed(
+                    threadId === parentThreadId
+                      ? parentProjection(dispatched.length > 0 ? [task] : [])
+                      : childProjection,
+                  ),
+                dispatch: (command) =>
+                  Effect.sync(() => {
+                    dispatched.push(command);
+                    return {
+                      sequence: 1,
+                      storedEvents: [
+                        {
+                          sequence: 1,
+                          commandId: null,
+                          event: { type: "subagent.updated", payload: task },
+                        },
+                      ],
+                    } as never;
+                  }),
+              }),
+              ServerSettings.layerTest({
+                delegateCheckoutRoots: [path.join(root, "clones"), "outside"],
+              }),
+              providerRegistryLayer([
+                providerSnapshot({
+                  instanceId: codexInstanceId,
+                  driver: ProviderDriverKind.make("codex"),
+                  model: "gpt-5.4",
+                }),
+              ]),
+              adapterRegistryLayer([codexInstanceId]),
+              Layer.mock(ProjectService.ProjectService)({
+                getById: () =>
+                  Effect.succeedSome({ id: projectId, workspaceRoot: project } as never),
+              }),
+              Layer.mock(SecretRequests.SecretRequests)({}),
+              Layer.mock(RemoteDelegation.RemoteDelegation)({}),
+              Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+            ),
+          ),
+        );
+        const mcp = yield* OrchestratorMcpService.OrchestratorMcpService.pipe(
+          Effect.provide(service),
+        );
+        const delegate = (checkout: string, isolation?: "worktree") =>
+          mcp.delegateTask(scope, {
+            task: "Review the change.",
+            checkout,
+            ...(isolation === undefined ? {} : { isolation }),
+            clientRequestId: `checkout-${checkout}-${isolation}`,
+          });
+        const strategies = () =>
+          dispatched.map(
+            (command) => (command as { workspaceStrategy?: unknown }).workspaceStrategy,
+          );
+
+        yield* delegate(review);
+        yield* delegate(sibling);
+        yield* delegate(configured);
+        assert.deepEqual(strategies(), [
+          { type: "existing_worktree", worktreePath: review },
+          { type: "existing_worktree", worktreePath: sibling },
+          { type: "existing_worktree", worktreePath: configured },
+        ]);
+
+        yield* fileSystem.writeFileString(path.join(review, "tracked.txt"), "two\n");
+        for (const [checkout, isolation, reason] of [
+          [outside, undefined, "or a delegateCheckoutRoots folder"],
+          [
+            path.join(sibling, "..", "sibling", "missing"),
+            undefined,
+            "real path of a Git checkout root",
+          ],
+          [path.join(clone, "projects"), undefined, "real path of a Git checkout root"],
+          ["projects/other", undefined, "not an absolute path"],
+          [review, undefined, "uncommitted changes to tracked files"],
+          [sibling, "worktree", "not both"],
+        ] as const) {
+          const refused = yield* delegate(checkout, isolation).pipe(Effect.flip);
+          assert.equal(refused.code, "invalid_request");
+          assert.include(refused.message, reason);
+        }
+        assert.lengthOf(strategies(), 3);
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
   it.effect(
