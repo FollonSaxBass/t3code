@@ -1,3 +1,6 @@
+// @effect-diagnostics-next-line nodeBuiltinImport:off - pure path math; the Path service would widen this layer.
+import * as NodePath from "node:path";
+
 import {
   CommandId,
   type RunId,
@@ -1337,6 +1340,54 @@ const make = Effect.gen(function* () {
         }),
       ),
     );
+
+  /** `checkout` once it is a clean Git checkout root in the project folder, a worktree, or a configured root. */
+  const resolveCheckout = Effect.fn("OrchestratorMcpService.resolveCheckout")(function* (
+    workspaceRoot: string,
+    checkout: string,
+  ) {
+    const refuse = (reason: string) => failure("invalid_request", `checkout ${checkout} ${reason}`);
+    if (!NodePath.isAbsolute(checkout)) return yield* refuse("is not an absolute path.");
+    const git = (cwd: string, args: ReadonlyArray<string>) =>
+      gitDriver.execute({ operation: "OrchestratorMcpService.resolveCheckout", cwd, args }).pipe(
+        Effect.map((result) => result.stdout.split("\n")),
+        Effect.orElseSucceed(() => null),
+      );
+    // Git reports real paths, so a symlinked spelling cannot reach outside the project.
+    const toplevel = (yield* git(checkout, ["rev-parse", "--show-toplevel"]))?.[0];
+    if (toplevel === undefined || toplevel !== NodePath.resolve(checkout))
+      return yield* refuse("is not the real path of a Git checkout root.");
+    const project = yield* git(workspaceRoot, ["rev-parse", "--show-toplevel", "--show-prefix"]);
+    const root =
+      project === null
+        ? NodePath.resolve(workspaceRoot)
+        : NodePath.join(project[0] ?? "", project[1] ?? "");
+    const inside = (folder: string) => {
+      const relative = NodePath.relative(folder, toplevel);
+      return !relative.startsWith("..") && !NodePath.isAbsolute(relative);
+    };
+    if (!inside(root)) {
+      const worktrees = yield* gitDriver
+        .listWorktreePaths(workspaceRoot)
+        .pipe(Effect.orElseSucceed((): ReadonlyArray<string> => []));
+      const { delegateCheckoutRoots } = yield* serverSettings.getSettings.pipe(
+        Effect.orElseSucceed(() => ({ delegateCheckoutRoots: [] as ReadonlyArray<string> })),
+      );
+      const roots = delegateCheckoutRoots.filter((folder) => NodePath.isAbsolute(folder));
+      if (
+        !worktrees.includes(toplevel) &&
+        !roots.some((folder) => inside(NodePath.resolve(folder)))
+      )
+        return yield* refuse(
+          "is not inside the project folder, one of its worktrees, or a delegateCheckoutRoots folder.",
+        );
+    }
+    // Untracked files stay allowed: a prepared checkout may carry private context files.
+    const changes = yield* git(toplevel, ["status", "--porcelain", "--untracked-files=no"]);
+    if (changes === null || changes.join("").trim() !== "")
+      return yield* refuse("has uncommitted changes to tracked files.");
+    return toplevel;
+  });
 
   const projectDefaultModelSelection = Effect.fn(
     "OrchestratorMcpService.projectDefaultModelSelection",
@@ -2887,6 +2938,19 @@ const make = Effect.gen(function* () {
         input.interactionMode,
       );
       let workspaceStrategy: OrchestrationV2ThreadLaunchWorkspaceStrategy | undefined;
+      if (input.checkout !== undefined && input.isolation === "worktree") {
+        return yield* failure(
+          "invalid_request",
+          'Pass either checkout or isolation "worktree", not both.',
+        );
+      }
+      if (input.checkout !== undefined && !isRetryOfAcceptedDelegation) {
+        const project = yield* requireProject(parent.thread.projectId);
+        workspaceStrategy = {
+          type: "existing_worktree",
+          worktreePath: yield* resolveCheckout(project.workspaceRoot, input.checkout),
+        };
+      }
       if (input.isolation === "worktree" && !isRetryOfAcceptedDelegation) {
         const project = yield* requireProject(parent.thread.projectId);
         const base = yield* gitDriver

@@ -297,6 +297,13 @@ const make = Effect.gen(function* () {
             'A task in a linked environment runs in that project\'s checkout; isolation "worktree" is not supported there. Omit isolation, or use t3_thread_launch with environmentId and a worktree workspaceStrategy.',
         });
       }
+      if (input.checkout !== undefined) {
+        return yield* new OrchestratorMcpFailure({
+          code: "invalid_request",
+          message:
+            "checkout names a path on this machine; a task in a linked environment runs in that project's checkout. Omit checkout.",
+        });
+      }
       // The provider and model inherit as they do for a task here. Another
       // provider there has no model to inherit, so the caller names one.
       const inherited = parent.thread.modelSelection;

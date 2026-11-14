@@ -1333,7 +1333,10 @@ it.effect("a task naming another driver there never runs its model on the parent
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );
 
-it.effect("refuses worktree isolation for a task there before launching anything", () =>
+it.effect.each([
+  { option: "isolation", input: { isolation: "worktree" } },
+  { option: "checkout", input: { checkout: "/repo/.worktrees/review" } },
+] as const)("refuses $option for a task there before launching anything", ({ option, input }) =>
   Effect.scoped(
     Effect.gen(function* () {
       const thread = yield* makeBoxThread;
@@ -1349,10 +1352,10 @@ it.effect("refuses worktree isolation for a task there before launching anything
       const result = yield* a.call("delegate_task", {
         task: "Run the suite on the box.",
         target: { environmentId: box.environmentId },
-        isolation: "worktree",
+        ...input,
       });
       expect(result.isError).toBe(true);
-      expect(JSON.stringify(result.content)).toContain("isolation");
+      expect(JSON.stringify(result.content)).toContain(`Omit ${option}`);
       expect(yield* Ref.get(thread.launched)).toBeNull();
     }),
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
