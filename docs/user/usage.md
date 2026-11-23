@@ -145,6 +145,31 @@ Opening Limits checks the selected connected environments automatically. Each cl
 least five minutes between automatic checks of an environment, including after a failed check.
 If a window still looks stale, refresh Limits to re-check every provider and hub.
 
+The server checks eligible native Codex accounts on the provider health interval in
+**Background activity**, even without a connected client or while the screen is locked.
+The Balanced profile checks every five minutes. The client and unattended timers,
+including retries, schedule at most about one usage read per minute for each provider
+instance on each T3 server. Instances and environments signed into the same account
+check independently. A manual refresh, opening Limits, a turn failing because of a
+usage limit, or the follow-up after an `auth.json` change can trigger an immediate read.
+If no client needs provider status after a failed check, the unattended timer schedules
+the next check one effective interval (at least 60 seconds) after the failure, plus
+any jitter. An interval of zero disables periodic checks. Unattended checks pause
+during suspension or serious or critical thermal pressure. Low power mode and battery
+follow your background activity profile.
+While a Codex session is open for an instance, including its idle period, and while
+a skills scan or reset-credit redemption runs, the timer skips that instance and
+keeps the last result. Native Codex turn notifications no longer update Limits.
+When `auth.json` changes, T3 can run one immediate check for the new login after
+any prior check shuts down. Usage briefly shows as unknown while T3 checks again.
+Native usage stays unknown if Codex reports a different home or the configured
+home's `auth.json` is missing or unreadable.
+Managed Codex accounts use the regular client-driven checks.
+
+A refused Codex login shows as signed out and its earlier limits disappear. Sign in
+again with `codex login` for the instance's Codex home, then refresh Limits.
+If the previous check is still shutting down, the credential refresh waits for it to finish.
+
 Pick `/usage-limits` from the composer's command menu, or send it as a message, to check the
 current model's limits without leaving the conversation. The result opens above the composer and
 closes when you dismiss it or send your next message. It uses the same snapshot as **Usage → Limits**, so it does not run the agent or refresh
