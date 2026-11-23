@@ -6,6 +6,7 @@ import type {
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Option from "effect/Option";
+import * as Schema from "effect/Schema";
 import type * as CodexErrors from "effect-codex-app-server/errors";
 
 import { clampPercent, makeUsageLimits } from "@t3tools/provider-core/server/usageLimits";
@@ -163,6 +164,78 @@ export function codexRateLimitsFailureMessage(error: CodexErrors.CodexAppServerE
     default:
       return "Codex did not answer the usage request.";
   }
+}
+
+export const CODEX_LOGIN_REFUSED_USAGE_MESSAGE = "The service refused this Codex login.";
+
+// A process that outlived a re-login says this; the current login is fine.
+const STALE_PROCESS_LOGIN = /since logged out or signed in to another account/i;
+const USAGE_ERROR_BODY =
+  /^failed to fetch codex rate limits: GET https:\/\/chatgpt\.com\/backend-api\/wham\/usage failed: \d{3}[^;\n]*; (?:content-type=[^\n]*?; )?body=([\s\S]+)$/;
+const REFUSAL_MESSAGES = new Set([
+  "encountered invalidated oauth token for user, failing request",
+  "your access token could not be refreshed because your refresh token has expired. please log out and sign in again.",
+  "your access token could not be refreshed because your refresh token was already used. please log out and sign in again.",
+  "your access token could not be refreshed because your refresh token was revoked. please log out and sign in again.",
+  "your access token could not be refreshed. please log out and sign in again.",
+  "your authentication session could not be refreshed automatically. please log out and sign in again.",
+  "codex account has no refresh token; sign in again",
+  "enterprise idp identity changed; sign in again and reconnect",
+  "enterprise idp credentials were removed; sign in again",
+  "enterprise idp id token is expired or invalid; sign in again",
+  "not logged in",
+  "not signed in",
+]);
+
+const decodeJson = Schema.decodeUnknownOption(Schema.fromJsonString(Schema.Unknown));
+const decodeError = Schema.decodeUnknownOption(
+  Schema.Struct({
+    code: Schema.optionalKey(Schema.Unknown),
+    message: Schema.optionalKey(Schema.Unknown),
+    error: Schema.optionalKey(Schema.Unknown),
+  }),
+);
+
+function refusalCodeIn(payload: unknown): boolean {
+  const outer = Option.getOrUndefined(decodeError(payload));
+  const inner = Option.getOrUndefined(decodeError(outer?.error));
+  const fields = [outer, inner];
+  if (
+    fields.some(
+      (field) => typeof field?.message === "string" && STALE_PROCESS_LOGIN.test(field.message),
+    )
+  )
+    return false;
+  return fields.some((field) => {
+    const code = field?.code;
+    return (
+      typeof code === "string" &&
+      (code === "token_revoked" ||
+        code === "token_invalidated" ||
+        code.startsWith("refresh_token_"))
+    );
+  });
+}
+
+function decodeErrorPayload(text: string): unknown {
+  const value = Option.getOrUndefined(decodeJson(text));
+  // Some app-server errors embed an escaped JSON body.
+  const unescaped =
+    value ?? (text.startsWith('{\\"') ? Option.getOrUndefined(decodeJson(`"${text}"`)) : undefined);
+  return typeof unescaped === "string" ? Option.getOrUndefined(decodeJson(unescaped)) : unescaped;
+}
+
+/** True when the service refused the stored login, which `codex login status` cannot tell. */
+export function isCodexLoginRefusal(error: CodexErrors.CodexAppServerError): boolean {
+  if (error._tag !== "CodexAppServerRequestError") return false;
+  const message = error.errorMessage.trim();
+  if (STALE_PROCESS_LOGIN.test(message)) return false;
+  if (REFUSAL_MESSAGES.has(message.toLowerCase())) return true;
+  const body = USAGE_ERROR_BODY.exec(message)?.[1];
+  return (
+    refusalCodeIn(typeof error.data === "string" ? decodeErrorPayload(error.data) : error.data) ||
+    (body !== undefined && refusalCodeIn(decodeErrorPayload(body)))
+  );
 }
 
 /** Rate-limit notifications are partial: omitted fields preserve earlier session values. */

@@ -17,7 +17,10 @@ import { makeCodexManagedRuntime } from "../CodexManagedRuntime.ts";
 import { ProviderDriverError } from "../Errors.ts";
 import { createCodexAdapterV2 } from "../../orchestration-v2/Adapters/CodexAdapterV2.ts";
 import {
-  checkCodexProviderStatus,
+  awaitInstanceCodexStatusProbe,
+  checkInstanceCodexProviderStatus,
+  makeCodexCredentialRefresh,
+  retainInstanceCodexAppServer,
   makePendingCodexProvider,
   probeCodexSkillsForCwd,
 } from "../CodexProvider.ts";
@@ -41,6 +44,9 @@ export const makeManagedCodexProvider = Effect.fn("makeManagedCodexProvider")(fu
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const host = yield* ProviderHost.ProviderHost;
+  const retainAppServer = retainInstanceCodexAppServer(instanceId).pipe(
+    Effect.provideService(ProviderHost.ProviderHost, host),
+  );
   const runtime = yield* makeCodexManagedRuntime({
     instanceId,
     enabled,
@@ -127,12 +133,13 @@ export const makeManagedCodexProvider = Effect.fn("makeManagedCodexProvider")(fu
     return yield* runtime.auth.controller.withAccess!(runtime.resolve).pipe(
       Effect.flatMap((effective) =>
         Effect.gen(function* () {
-          const draft = yield* checkCodexProviderStatus(
+          const draft = yield* checkInstanceCodexProviderStatus(
+            instanceId,
             effective.config,
-            undefined,
             effective.environment,
-            managedAuth,
+            { managedAuth },
           );
+          if (!draft) return undefined;
           const credentials = yield* runtime.auth.access;
           // Another server can replace the saved profile while the native probe runs.
           // Never send that account's token with the launch profile's catalog labels.
@@ -151,8 +158,9 @@ export const makeManagedCodexProvider = Effect.fn("makeManagedCodexProvider")(fu
           return { ...draft, models };
         }),
       ),
-      Effect.map((draft) =>
-        stamp({
+      Effect.map((draft) => {
+        if (!draft) return undefined;
+        return stamp({
           ...draft,
           auth: managedAuth,
           version: draft.version ?? executable.value.version,
@@ -177,8 +185,8 @@ export const makeManagedCodexProvider = Effect.fn("makeManagedCodexProvider")(fu
                 slashCommands: draft.slashCommands.filter((command) => command.name !== "feedback"),
               }
             : {}),
-        }),
-      ),
+        });
+      }),
       Effect.catch(() =>
         runtime.auth.read.pipe(
           Effect.orElseSucceed(() => Option.none()),
@@ -211,6 +219,7 @@ export const makeManagedCodexProvider = Effect.fn("makeManagedCodexProvider")(fu
       Effect.scoped,
     );
   }).pipe(
+    Effect.provideService(ProviderHost.ProviderHost, host),
     Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
     Effect.provideService(FileSystem.FileSystem, fileSystem),
     Effect.provideService(Path.Path, path),
@@ -222,6 +231,9 @@ export const makeManagedCodexProvider = Effect.fn("makeManagedCodexProvider")(fu
     haveSettingsChanged: () => false,
     initialSnapshot: () => pending,
     checkProvider: check,
+    waitForPreviousCheck: awaitInstanceCodexStatusProbe(instanceId).pipe(
+      Effect.provideService(ProviderHost.ProviderHost, host),
+    ),
   }).pipe(
     Effect.mapError(
       (cause) =>
@@ -233,10 +245,14 @@ export const makeManagedCodexProvider = Effect.fn("makeManagedCodexProvider")(fu
         }),
     ),
   );
+  const refreshForCredentials = yield* makeCodexCredentialRefresh(
+    instanceId,
+    snapshot.refresh,
+  ).pipe(Effect.provideService(ProviderHost.ProviderHost, host));
   yield* runtime.auth.controller.subscribe("managed-codex-snapshot").pipe(
     Stream.filter((state) => ["idle", "succeeded", "failed", "cancelled"].includes(state.phase)),
     // Sign-out interrupts in-flight probes; keep listening for its subsequent idle refresh.
-    Stream.runForEach(() => snapshot.refresh.pipe(Effect.ignoreCause({ log: true }))),
+    Stream.runForEach(() => refreshForCredentials),
     Effect.forkScoped,
   );
   const resolveRuntime = runtime.auth.controller.withAccess!(runtime.resolve);
@@ -245,6 +261,7 @@ export const makeManagedCodexProvider = Effect.fn("makeManagedCodexProvider")(fu
   const models = snapshot.getSnapshot.pipe(Effect.map((value) => value.models));
   const orchestrationAdapter = yield* createCodexAdapterV2(input, {
     onUsageLimits: (update) => snapshot.applyUsageLimits(update),
+    retainAppServer,
     models,
     resolveRuntime: runtime.resolve,
   }).pipe(
@@ -316,13 +333,16 @@ export const makeManagedCodexProvider = Effect.fn("makeManagedCodexProvider")(fu
                   ),
                 ),
               onSuccess: (effective) =>
-                probeCodexSkillsForCwd({
-                  binaryPath: effective.config.binaryPath,
-                  homePath: effective.config.homePath,
-                  launchArgs: effective.config.launchArgs,
-                  cwd,
-                  environment: effective.environment,
-                }).pipe(
+                retainAppServer.pipe(
+                  Effect.andThen(
+                    probeCodexSkillsForCwd({
+                      binaryPath: effective.config.binaryPath,
+                      homePath: effective.config.homePath,
+                      launchArgs: effective.config.launchArgs,
+                      cwd,
+                      environment: effective.environment,
+                    }),
+                  ),
                   Effect.flatMap((skills) =>
                     snapshot.getSnapshot.pipe(Effect.map((draft) => ({ ...draft, skills }))),
                   ),

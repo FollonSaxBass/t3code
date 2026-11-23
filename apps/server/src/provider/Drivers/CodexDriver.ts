@@ -3,11 +3,11 @@ import { CodexSettings, ProviderDriverKind } from "@t3tools/contracts";
 import * as Digest from "effect/crypto/Digest";
 import * as SecureRandom from "effect/crypto/SecureRandom";
 import type * as Signature from "effect/crypto/Signature";
-import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
+import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import { HttpClient, HttpClientResponse } from "effect/http";
@@ -27,11 +27,15 @@ import {
 import { ProviderDriverError } from "../Errors.ts";
 import * as ResetCreditCoordinator from "../resetCreditCoordinator.ts";
 import {
-  checkCodexProviderStatus,
+  awaitInstanceCodexStatusProbe,
+  checkInstanceCodexProviderStatus,
+  makeCodexCredentialMonitor,
+  retainInstanceCodexAppServer,
   makePendingCodexProvider,
   makeCodexSkillsProbe,
   withCodexAppServerClient,
 } from "../CodexProvider.ts";
+import { readProviderStatusCache, resolveProviderStatusCachePath } from "../providerStatusCache.ts";
 import { resolveCodexLaunchArgs } from "../codexLaunchArgs.ts";
 import { makeManagedServerProvider } from "@t3tools/provider-core/server/managedProvider";
 import * as ModelCatalog from "@t3tools/provider-core/server/ModelCatalog";
@@ -67,6 +71,7 @@ import * as HostProcess from "@t3tools/shared/HostProcess";
 const decodeCodexSettings = Schema.decodeSync(CodexSettings);
 
 const DRIVER_KIND = ProviderDriverKind.make("codex");
+
 const CODEX_STANDALONE_HOME_PATTERN = /^(.*)\/packages\/standalone\//is;
 
 function codexStandaloneHome(commandPath: string): string | null {
@@ -147,6 +152,11 @@ export type CodexDriverEnv =
   | CodexInstallation.CodexInstallation
   | CodexManagedTokenBroker.CodexManagedTokenBroker;
 
+// Unattended probes spawn Codex without a client watching, so they never run back to back.
+const UNATTENDED_MIN_INTERVAL_MS = 60_000;
+// A route can switch back to native quota through config edits that nothing watches.
+const UNSUPPORTED_ROUTE_RECHECK_MAX_MS = 30 * 60_000;
+
 export const CodexDriver: ProviderDriver<
   CodexSettings,
   CodexDriverEnv,
@@ -177,6 +187,10 @@ export const CodexDriver: ProviderDriver<
         enabled,
         config,
       });
+    const host = yield* ProviderHost.ProviderHost;
+    const retainAppServer = retainInstanceCodexAppServer(instanceId).pipe(
+      Effect.provideService(ProviderHost.ProviderHost, host),
+    );
     const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
     const resetCreditCoordinator = yield* ResetCreditCoordinator.ResetCreditCoordinator;
     const fileSystem = yield* FileSystem.FileSystem;
@@ -250,11 +264,11 @@ export const CodexDriver: ProviderDriver<
         config: homeConfig,
       },
       {
-        onUsageLimits: (update) => snapshot.applyUsageLimits(update),
         models: Effect.suspend(() => snapshot.getSnapshot).pipe(
           Effect.map((value) => value.models),
         ),
         compatibility: installation.compatibility,
+        retainAppServer,
       },
     ).pipe(
       Effect.mapError(
@@ -268,17 +282,34 @@ export const CodexDriver: ProviderDriver<
       ),
     );
 
+    const cached = enabled
+      ? yield* resolveProviderStatusCachePath({
+          cacheDir: host.paths.providerStatusCacheDir,
+          instanceId,
+        }).pipe(Effect.flatMap(readProviderStatusCache))
+      : undefined;
+    const loginRefusedState = yield* Ref.make(
+      cached?.instanceId === instanceId && cached.driver === DRIVER_KIND
+        ? cached.codexLoginRefusal
+        : undefined,
+    );
+    const accountKey = homeLayout.effectiveHomePath ?? homeLayout.sharedHomePath;
+    const credentials = yield* makeCodexCredentialMonitor(accountKey);
     // Kick the TTL-gated manifest refresh in the background and classify with the in-memory
     // manifest, so a slow or hung fetch never delays the provider check.
     const checkProvider = modelCatalog.refreshInBackground.pipe(
       Effect.andThen(
         Effect.zipWith(
-          checkCodexProviderStatus(effectiveConfig, undefined, processEnv),
+          checkInstanceCodexProviderStatus(instanceId, effectiveConfig, processEnv, {
+            loginRefusedState,
+            credentials,
+          }),
           currentCatalog,
-          (draft, catalog) => stampIdentity(applyCodexModelCatalog(draft, catalog)),
+          (draft, catalog) => draft && stampIdentity(applyCodexModelCatalog(draft, catalog)),
           { concurrent: true },
         ),
       ),
+      Effect.provideService(ProviderHost.ProviderHost, host),
       Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
       Effect.provideService(FileSystem.FileSystem, fileSystem),
       Effect.provideService(Path.Path, pathService),
@@ -296,6 +327,22 @@ export const CodexDriver: ProviderDriver<
           (draft, catalog) => stampIdentity(applyCodexModelCatalog(draft, catalog)),
         ),
       checkProvider,
+      waitForPreviousCheck: awaitInstanceCodexStatusProbe(instanceId).pipe(
+        Effect.provideService(ProviderHost.ProviderHost, host),
+      ),
+      unattendedRefreshInterval: (snapshot, configuredMs) => {
+        const intervalMs = Math.max(UNATTENDED_MIN_INTERVAL_MS, configuredMs);
+        return Effect.succeed(
+          snapshot.usageLimits?.unavailable?.reason === "unsupported"
+            ? {
+                intervalMs: Math.min(intervalMs * 6, UNSUPPORTED_ROUTE_RECHECK_MAX_MS),
+                jitter: false,
+              }
+            : { intervalMs, jitter: true },
+        );
+      },
+      probeOnlyUsage: true,
+      isProbedUsageCurrent: credentials.isCurrent,
       enrichSnapshot: ({ settings, snapshot, publishSnapshot }) =>
         resolveMaintenance().pipe(
           Effect.flatMap((maintenanceCapabilities) =>
@@ -323,7 +370,7 @@ export const CodexDriver: ProviderDriver<
       processEnv,
       snapshot.getSnapshot.pipe(Effect.map((value) => value.models)),
     );
-    const probeSkills = yield* makeCodexSkillsProbe().pipe(
+    const probeSkills = yield* makeCodexSkillsProbe(retainAppServer).pipe(
       Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
     );
     const snapshotForCwd = (cwd: string) =>
@@ -354,11 +401,11 @@ export const CodexDriver: ProviderDriver<
     // Redemption spends account credit; serialize by the auth.json directory, keep one idempotency key
     // until the outcome, and bound the wait so a hung app-server cannot hold the account lock.
     // Auth overlays use effectiveHomePath; the continuation key would conflate them with shared homes.
-    const accountKey = homeLayout.effectiveHomePath ?? homeLayout.sharedHomePath;
     const consumeResetCredit: NonNullable<ProviderInstance["consumeResetCredit"]> = () =>
       resetCreditCoordinator
         .redeem(accountKey, (idempotencyKey) =>
           Effect.gen(function* () {
+            yield* retainAppServer;
             const { client } = yield* withCodexAppServerClient({
               binaryPath: effectiveConfig.binaryPath,
               homePath: effectiveConfig.homePath,
@@ -405,10 +452,12 @@ export const CodexDriver: ProviderDriver<
 
     // `codex login` and `codex logout` rewrite auth.json outside T3.
     if (effectiveConfig.enabled) {
+      yield* credentials
+        .run(instanceId, snapshot.refresh)
+        .pipe(Effect.provideService(ProviderHost.ProviderHost, host));
       yield* fileSystem.watch(accountKey).pipe(
         Stream.filter((event) => pathService.basename(event.path) === "auth.json"),
-        Stream.debounce(Duration.millis(250)),
-        Stream.runForEach(() => snapshot.refresh.pipe(Effect.ignoreCause({ log: true }))),
+        Stream.runForEach(() => credentials.sample(snapshot.clearUsage)),
         Effect.catchReason("PlatformError", "NotFound", () => Effect.void),
         Effect.ignoreCause({ log: true }),
         Effect.forkScoped,

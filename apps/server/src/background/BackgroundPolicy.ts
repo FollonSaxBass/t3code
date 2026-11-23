@@ -35,6 +35,11 @@ export class BackgroundPolicy extends Context.Service<
     ) => Effect.Effect<void>;
     readonly snapshot: Effect.Effect<BackgroundPolicySnapshot>;
     readonly shouldRunScopeWork: (scope: BackgroundScope) => Effect.Effect<boolean>;
+    /**
+     * Unattended work needs no client and ignores the screen lock; suspension, thermal pressure
+     * and the low-power and battery pauses still apply.
+     */
+    readonly shouldRunUnattendedWork: Effect.Effect<boolean>;
     readonly shouldRunOpportunisticWork: Effect.Effect<boolean>;
   }
 >()("t3/background/BackgroundPolicy") {}
@@ -261,6 +266,16 @@ export const make = Effect.fn("background.policy.make")(function* () {
     );
   });
 
+  const shouldRunUnattendedWork = Effect.all([
+    hostPowerMonitor.snapshot,
+    backgroundActivitySettings,
+  ]).pipe(
+    Effect.map(
+      ([hostPower, settings]) =>
+        !isHostConstrained(hostPower, { ...settings, pauseWhenHostLocked: false }),
+    ),
+  );
+
   const shouldRunOpportunisticWork = Effect.map(
     snapshot,
     (current) => current.shouldRunOpportunisticWork,
@@ -290,6 +305,7 @@ export const make = Effect.fn("background.policy.make")(function* () {
     removeRpcClient,
     snapshot,
     shouldRunScopeWork,
+    shouldRunUnattendedWork,
     shouldRunOpportunisticWork,
   });
 });

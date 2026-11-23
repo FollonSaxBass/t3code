@@ -464,6 +464,14 @@ export const layer = Layer.effect(
 
     const bootInstances = yield* instanceRegistry.listInstances;
     const bootSources = bootInstances.map(buildSnapshotSource);
+    // Sample before reading so a first check finishing mid-read cannot make a placeholder persist.
+    const awaitingBootInstances = new Set<ProviderInstance>();
+    for (const instance of bootInstances) {
+      if (yield* instance.snapshot.isAwaitingFirstCheck ?? Effect.succeed(false)) {
+        awaitingBootInstances.add(instance);
+      }
+    }
+
     const fallbackProviders = yield* loadProviders(bootSources);
     const fallbackByInstance = new Map<ProviderInstanceId, ServerProvider>();
     for (let index = 0; index < fallbackProviders.length; index++) {
@@ -473,13 +481,6 @@ export const layer = Layer.effect(
         continue;
       }
       fallbackByInstance.set(source.instanceId, provider);
-    }
-    // Read after the snapshots: a snapshot read as awaiting is the pre-check placeholder.
-    const awaitingBootInstances = new Set<ProviderInstance>();
-    for (const instance of bootInstances) {
-      if (yield* instance.snapshot.isAwaitingFirstCheck ?? Effect.succeed(false)) {
-        awaitingBootInstances.add(instance);
-      }
     }
 
     const bootProviders = yield* Effect.forEach(
@@ -560,26 +561,40 @@ export const layer = Layer.effect(
       new Map(),
     );
     const syncSemaphore = yield* Semaphore.make(1);
+    const replacingSeenRef = yield* Ref.make<ReadonlySet<ProviderInstanceId>>(new Set());
+    const cacheWritePermits = new Map<ProviderInstanceId, Semaphore.Semaphore>();
 
     const persistProvider = Effect.fn("ProviderRegistry.persistProvider")(function* (
-      provider: ServerProvider,
+      instanceId: ProviderInstanceId,
     ) {
-      const key = snapshotInstanceKey(provider);
-      const filePath = yield* resolveProviderStatusCachePath({
-        cacheDir: config.providerStatusCacheDir,
-        instanceId: key,
-      }).pipe(Effect.provideService(Path.Path, path));
-      const {
-        workspaceSnapshots: _workspaceSnapshots,
-        workspaceRescannedAt: _workspaceRescannedAt,
-        ...machineProvider
-      } = provider;
-      yield* writeProviderStatusCache({ filePath, provider: machineProvider }).pipe(
-        Effect.provideService(FileSystem.FileSystem, fileSystem),
-        Effect.provideService(Path.Path, path),
-        Effect.tapError(Effect.logError),
-        Effect.ignore,
-      );
+      const permit = cacheWritePermits.get(instanceId) ?? Semaphore.makeUnsafe(1);
+      cacheWritePermits.set(instanceId, permit);
+      yield* permit
+        .withPermits(1)(
+          Effect.gen(function* () {
+            const provider = (yield* Ref.get(providersRef)).find(
+              (candidate) => snapshotInstanceKey(candidate) === instanceId,
+            );
+            if (!provider) return;
+            const filePath = yield* resolveProviderStatusCachePath({
+              cacheDir: config.providerStatusCacheDir,
+              instanceId,
+            });
+            const {
+              workspaceSnapshots: _workspaceSnapshots,
+              workspaceRescannedAt: _workspaceRescannedAt,
+              ...machineProvider
+            } = provider;
+            yield* writeProviderStatusCache({ filePath, provider: machineProvider }).pipe(
+              Effect.tapError(Effect.logError),
+              Effect.ignore,
+            );
+          }),
+        )
+        .pipe(
+          Effect.provideService(FileSystem.FileSystem, fileSystem),
+          Effect.provideService(Path.Path, path),
+        );
     });
 
     const applyProviderUpdateState = Effect.fn("applyProviderUpdateState")(function* (
@@ -613,51 +628,50 @@ export const layer = Layer.effect(
           concurrency: "unbounded",
         },
       );
-      const [previousProviders, providers, providersToPersist] = yield* Ref.modify(
-        providersRef,
-        (previousProviders) => {
-          const mergedProviders = new Map(
-            previousProviders.map((provider) => [snapshotInstanceKey(provider), provider] as const),
-          );
-          const updatedKeys = new Set<ProviderInstanceId>();
+      return yield* Ref.modify(providersRef, (previousProviders) => {
+        const mergedProviders = new Map(
+          previousProviders.map((provider) => [snapshotInstanceKey(provider), provider] as const),
+        );
+        const updatedKeys = new Set<ProviderInstanceId>();
 
-          for (const provider of nextProvidersWithUpdateState) {
-            const key = snapshotInstanceKey(provider);
-            updatedKeys.add(key);
-            mergedProviders.set(
-              key,
-              options?.replace === true
-                ? provider
-                : mergeProviderSnapshot(mergedProviders.get(key), provider),
-            );
-          }
+        for (const provider of nextProvidersWithUpdateState) {
+          const key = snapshotInstanceKey(provider);
+          updatedKeys.add(key);
+          mergedProviders.set(
+            key,
+            options?.replace === true
+              ? provider
+              : mergeProviderSnapshot(mergedProviders.get(key), provider),
+          );
+        }
 
-          const providers = orderProviderSnapshots(
-            [...mergedProviders.values()].map((provider) =>
-              classifyCompatibility(provider, manifest),
-            ),
-          );
-          const providersToPersist = providers.filter((provider) =>
-            updatedKeys.has(snapshotInstanceKey(provider)),
-          );
-          return [[previousProviders, providers, providersToPersist] as const, providers];
-        },
+        const providers = orderProviderSnapshots(
+          [...mergedProviders.values()].map((provider) =>
+            classifyCompatibility(provider, manifest),
+          ),
+        );
+        return [[previousProviders, providers, updatedKeys] as const, providers];
+      }).pipe(
+        Effect.flatMap(
+          Effect.fnUntraced(function* ([previousProviders, providers, updatedKeys]) {
+            if (haveProvidersChanged(previousProviders, providers)) {
+              if (options?.persist !== false) {
+                yield* Effect.forEach(updatedKeys, persistProvider, {
+                  concurrency: "unbounded",
+                  discard: true,
+                });
+              }
+              if (options?.publish !== false) {
+                // A newer upsert may have committed during the cache write.
+                yield* PubSub.publish(changesPubSub, yield* Ref.get(providersRef));
+              }
+            }
+            return providers;
+          }),
+        ),
+        // An identical snapshot can skip persistence as soon as it is in memory.
+        Effect.uninterruptible,
       );
-
-      if (haveProvidersChanged(previousProviders, providers)) {
-        if (options?.persist !== false) {
-          yield* Effect.forEach(providersToPersist, persistProvider, {
-            concurrency: "unbounded",
-            discard: true,
-          });
-        }
-        if (options?.publish !== false) {
-          // A newer upsert may have committed and published during the cache write; never republish an older array.
-          yield* PubSub.publish(changesPubSub, yield* Ref.get(providersRef));
-        }
-      }
-
-      return providers;
     });
 
     const compatibilityRefreshRunning = yield* Ref.make(false);
@@ -734,11 +748,22 @@ export const layer = Layer.effect(
         .getInstance(instance.instanceId)
         .pipe(Effect.map((current) => current === instance));
 
+    const awaitingCodexCheck = (instance: ProviderInstance) =>
+      instance.driverKind === "codex"
+        ? (instance.snapshot.isAwaitingFirstCheck ?? Effect.succeed(false))
+        : Effect.succeed(false);
+
     const refreshOneSource = Effect.fn("refreshOneSource")(function* (instance: ProviderInstance) {
       const providerSource = buildSnapshotSource(instance);
       // Enrichment can publish a newer snapshot before refresh returns its pre-enrichment probe.
       const probe = yield* providerSource.refresh.pipe(
-        Effect.andThen(providerSource.getSnapshot),
+        Effect.andThen(
+          awaitingCodexCheck(instance).pipe(
+            Effect.flatMap((awaiting) =>
+              awaiting ? Effect.undefined : providerSource.getSnapshot,
+            ),
+          ),
+        ),
         Effect.exit,
       );
       // Settings can replace or remove the instance mid-probe; its late result or failure is stale.
@@ -746,6 +771,7 @@ export const layer = Layer.effect(
         return yield* Ref.get(providersRef);
       }
       const nextProvider = yield* probe;
+      if (nextProvider === undefined) return yield* Ref.get(providersRef);
       return yield* correlateSnapshotWithSource(providerSource, nextProvider).pipe(
         Effect.flatMap(syncProvider),
       );
@@ -1005,6 +1031,9 @@ export const layer = Layer.effect(
       Effect.gen(function* () {
         const instances = yield* instanceRegistry.listInstances;
         const unavailableProviders = yield* instanceRegistry.listUnavailable;
+        const replacing = yield* (
+          instanceRegistry.listReplacing ?? Effect.succeed(new Set<ProviderInstanceId>())
+        );
         const nextByInstance = new Map<ProviderInstanceId, ProviderInstance>(
           instances.map((instance) => [instance.instanceId, instance] as const),
         );
@@ -1012,7 +1041,13 @@ export const layer = Layer.effect(
         for (const provider of unavailableProviders) {
           knownInstanceIds.add(snapshotInstanceKey(provider));
         }
+        // A row whose instance is mid-replacement stays until the replacement reports.
+        for (const instanceId of replacing) knownInstanceIds.add(instanceId);
         const previousSubs = yield* Ref.get(liveSubsRef);
+        const replacedEarlier = yield* Ref.getAndSet(
+          replacingSeenRef,
+          new Set([...replacing].filter((instanceId) => !nextByInstance.has(instanceId))),
+        );
 
         const carriedOver = new Map<ProviderInstanceId, ProviderInstance>();
         for (const [instanceId, previousInstance] of previousSubs) {
@@ -1033,7 +1068,9 @@ export const layer = Layer.effect(
         const rebuiltInstanceIds = new Set(
           newlyAdded
             .map(([instanceId]) => instanceId)
-            .filter((instanceId) => previousSubs.has(instanceId)),
+            .filter(
+              (instanceId) => previousSubs.has(instanceId) || replacedEarlier.has(instanceId),
+            ),
         );
         if (rebuiltInstanceIds.size > 0) {
           const [previousProviders, providers] = yield* Ref.modify(
@@ -1056,7 +1093,15 @@ export const layer = Layer.effect(
         for (const [, instance] of newlyAdded) {
           const source = buildSnapshotSource(instance);
           yield* Stream.runForEach(source.streamChanges, (provider) =>
-            correlateSnapshotWithSource(source, provider).pipe(Effect.flatMap(syncProvider)),
+            awaitingCodexCheck(instance).pipe(
+              Effect.flatMap((awaiting) =>
+                awaiting
+                  ? Effect.void
+                  : correlateSnapshotWithSource(source, provider).pipe(
+                      Effect.flatMap(syncProvider),
+                    ),
+              ),
+            ),
           ).pipe(Effect.forkScoped);
           if (instance.workspaceRescans) {
             yield* Stream.runForEach(instance.workspaceRescans, (cwd) =>
@@ -1071,14 +1116,15 @@ export const layer = Layer.effect(
           ([, instance]) =>
             Effect.gen(function* () {
               const source = buildSnapshotSource(instance);
-              const provider = yield* source.getSnapshot;
               // Boot shows the cached status until this instance's first check publishes a result.
               if (
-                awaitingBootInstances.has(instance) &&
-                (yield* instance.snapshot.isAwaitingFirstCheck ?? Effect.succeed(false))
+                (yield* awaitingCodexCheck(instance)) ||
+                (awaitingBootInstances.has(instance) &&
+                  (yield* instance.snapshot.isAwaitingFirstCheck ?? Effect.succeed(false)))
               ) {
                 return yield* refreshCompatibility;
               }
+              const provider = yield* source.getSnapshot;
               yield* correlateSnapshotWithSource(source, provider).pipe(
                 Effect.flatMap(syncProvider),
               );

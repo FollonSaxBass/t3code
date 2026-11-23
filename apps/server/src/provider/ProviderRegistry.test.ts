@@ -42,7 +42,7 @@ import {
   type ServerSettings as ContractServerSettings,
 } from "@t3tools/contracts";
 import { HttpClient, HttpClientResponse } from "effect/http";
-import { ChildProcessSpawner } from "effect/process";
+import { ChildProcess, ChildProcessSpawner } from "effect/process";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import { WindowsShellEnvironment } from "@t3tools/shared/shell";
 import { deepMerge } from "@t3tools/shared/Struct";
@@ -342,6 +342,130 @@ function claudeCapabilities(overrides: Partial<TestClaudeCapabilities> = {}) {
       ...overrides,
     });
 }
+
+/**
+ * A Codex app-server whose handshake and usage answer wait for `handshake` and `usageAnswered`.
+ * Process-group checks report child processes until `setStartupWork(false)`.
+ */
+const makeGatedCodexAppServer = Effect.fn("ProviderRegistry.test.makeGatedCodexAppServer")(
+  function* (gates: {
+    readonly spawnReady?: Deferred.Deferred<void>;
+    readonly handshake: Deferred.Deferred<void>;
+    readonly usageAnswered: Deferred.Deferred<void>;
+    readonly startupCheck?: Deferred.Deferred<void>;
+    readonly usageReply?: Record<string, unknown>;
+  }) {
+    const fileSystem = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const codexHome = yield* fileSystem.makeTempDirectoryScoped();
+    yield* fileSystem.writeFileString(path.join(codexHome, "auth.json"), "{}\n");
+    // A catalog refreshed after spawn ends the ChatGPT catalog wait without the clock.
+    yield* fileSystem.writeFileString(
+      path.join(codexHome, "models_cache.json"),
+      JSON.stringify({ fetched_at: "2999-01-01T00:00:00.000Z" }),
+    );
+    let startupWork = true;
+    let released = 0;
+    const stopped = yield* Queue.unbounded<void>();
+    const handshakeRequested = yield* Deferred.make<void>();
+    const usageRequested = yield* Deferred.make<void>();
+    const spawned = yield* Queue.unbounded<void>();
+    const results: Record<string, unknown> = {
+      initialize: {
+        userAgent: "codex_cli_rs/0.167.0",
+        codexHome,
+        platformFamily: "unix",
+        platformOs: "linux",
+      },
+      "account/read": {
+        account: { type: "chatgpt", email: "test@example.com", planType: "pro" },
+        requiresOpenaiAuth: true,
+      },
+      "config/read": { config: {}, origins: {} },
+      "account/rateLimits/read": {
+        rateLimits: { limitId: "codex", planType: "pro", primary: { usedPercent: 42 } },
+        rateLimitsByLimitId: null,
+        rateLimitResetCredits: null,
+        accountId: null,
+      },
+    };
+    const spawner = ChildProcessSpawner.make((command) =>
+      Effect.gen(function* () {
+        if (ChildProcess.isStandardCommand(command) && command.command === "pgrep") {
+          const handle = mockHandle({
+            stdout: startupWork ? "1\n2\n" : "1\n",
+            stderr: "",
+            code: 0,
+          });
+          if (gates.startupCheck) yield* Deferred.succeed(gates.startupCheck, undefined);
+          return handle;
+        }
+        if (ChildProcess.isStandardCommand(command) && !command.args.includes("app-server")) {
+          return mockHandle({ stdout: "codex-cli 0.167.0\n", stderr: "", code: 0 });
+        }
+        const scope = yield* Effect.scope;
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => released++).pipe(Effect.andThen(Queue.offer(stopped, undefined))),
+        );
+        yield* Queue.offer(spawned, undefined);
+        if (gates.spawnReady) yield* Deferred.await(gates.spawnReady);
+        const output = yield* Queue.unbounded<Uint8Array>();
+        const send = (message: unknown) =>
+          Queue.offer(output, encoder.encode(`${JSON.stringify(message)}\n`));
+        const answer = (line: string) => {
+          const { id, method } = JSON.parse(line) as { id?: number; method?: string };
+          if (id === undefined || method === undefined) return Effect.void;
+          const gate =
+            method === "initialize"
+              ? gates.handshake
+              : method === "account/rateLimits/read"
+                ? gates.usageAnswered
+                : undefined;
+          const reply = send(
+            method === "account/rateLimits/read" && gates.usageReply
+              ? { id, ...gates.usageReply }
+              : { id, result: results[method] ?? { data: [] } },
+          );
+          const requested =
+            method === "initialize"
+              ? Deferred.succeed(handshakeRequested, undefined)
+              : method === "account/rateLimits/read"
+                ? Deferred.succeed(usageRequested, undefined)
+                : Effect.void;
+          const answered = gate
+            ? Deferred.await(gate).pipe(Effect.andThen(reply), Effect.forkIn(scope), Effect.asVoid)
+            : Effect.asVoid(reply);
+          return requested.pipe(Effect.andThen(answered));
+        };
+        const decoder = new TextDecoder();
+        let buffered = "";
+        return ChildProcessSpawner.makeHandle({
+          ...mockHandle({ stdout: "", stderr: "", code: 0 }),
+          exitCode: Effect.never,
+          isRunning: Effect.succeed(true),
+          stdin: Sink.forEach((chunk: Uint8Array) => {
+            buffered += decoder.decode(chunk, { stream: true });
+            const lines = buffered.split("\n");
+            buffered = lines.pop() ?? "";
+            return Effect.forEach(lines.filter(Boolean), answer, { discard: true });
+          }),
+          stdout: Stream.fromQueue(output),
+        });
+      }),
+    );
+    return {
+      spawner,
+      awaitSpawn: Queue.take(spawned),
+      handshakeRequested,
+      usageRequested,
+      released: () => released,
+      awaitStop: Queue.take(stopped),
+      setStartupWork: (busy: boolean) => {
+        startupWork = busy;
+      },
+    };
+  },
+);
 
 function mockHandle(result: { stdout: string; stderr: string; code: number }) {
   return ChildProcessSpawner.makeHandle({
@@ -686,6 +810,61 @@ it.layer(
       }),
     );
 
+    it.effect("shows a refused login as signed out ahead of a missing model catalog", () =>
+      Effect.gen(function* () {
+        const status = yield* checkCodexProviderStatus(defaultCodexSettings, () =>
+          Effect.succeed(
+            makeCodexProbeSnapshot({
+              models: undefined,
+              nativeUsage: true,
+              rateLimits: { failure: "The service refused this Codex login.", loginRefused: true },
+            }),
+          ),
+        );
+
+        assert.strictEqual(status.status, "error");
+        assert.strictEqual(status.auth.status, "unauthenticated");
+        assert.strictEqual(status.auth.email, "test@example.com");
+        assert.strictEqual(
+          status.message,
+          "The service refused this Codex login. Run `codex login` and try again.",
+        );
+        assert.deepStrictEqual(status.usageLimits?.unavailable, {
+          reason: "probeFailed",
+          message: "The service refused this Codex login.",
+        });
+      }),
+    );
+
+    it.effect("retries usage after a config read failure instead of calling it unsupported", () =>
+      Effect.gen(function* () {
+        const status = yield* checkCodexProviderStatus(defaultCodexSettings, () =>
+          Effect.succeed(makeCodexProbeSnapshot({ configUnavailable: true })),
+        );
+
+        assert.strictEqual(status.status, "ready");
+        assert.deepStrictEqual(status.usageLimits?.unavailable, {
+          reason: "probeFailed",
+          message: "Codex did not return its configuration in time, so usage was not read.",
+        });
+      }),
+    );
+
+    it.effect("omits the home fingerprint when the reported path cannot be resolved", () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const directory = yield* fs.makeTempDirectoryScoped();
+        const codexHome = path.join(directory, "missing-home");
+        const status = yield* checkCodexProviderStatus(defaultCodexSettings, () =>
+          Effect.succeed(makeCodexProbeSnapshot({ codexHome })),
+        );
+
+        assert.strictEqual(status.auth.status, "authenticated");
+        assert.notProperty(status, "homeFingerprint");
+      }),
+    );
+
     it.effect("returns unauthenticated when app-server requires OpenAI auth", () =>
       Effect.gen(function* () {
         const status = yield* checkCodexProviderStatus(defaultCodexSettings, () =>
@@ -936,6 +1115,10 @@ it.layer(
 
     it.effect("shows Codex usage that answers after three seconds inside the probe budget", () =>
       Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const codexHome = yield* fs.makeTempDirectoryScoped();
+        yield* fs.writeFileString(path.join(codexHome, "auth.json"), "{}\n");
         const usageRequested = yield* Deferred.make<void>();
         const spawner = ChildProcessSpawner.make(() =>
           Effect.gen(function* () {
@@ -946,7 +1129,7 @@ it.layer(
             const results: Record<string, unknown> = {
               initialize: {
                 userAgent: "codex_cli_rs/0.167.0",
-                codexHome: "/nonexistent-codex-home",
+                codexHome,
                 platformFamily: "unix",
                 platformOs: "linux",
               },
@@ -1011,6 +1194,137 @@ it.layer(
         assert.strictEqual(status.auth.status, "authenticated");
         assert.isUndefined(status.usageLimits?.unavailable);
         assert.strictEqual(status.usageLimits?.windows[0]?.usedPercent, 42);
+      }),
+    );
+
+    it.effect("keeps Codex running until slow answers and startup work end, on every exit", () =>
+      Effect.gen(function* () {
+        const check = (spawner: ChildProcessSpawner.ChildProcessSpawner["Service"]) =>
+          checkCodexProviderStatus(defaultCodexSettings).pipe(
+            Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+            Effect.forkChild,
+          );
+        const handshake = yield* Deferred.make<void>();
+        const usageAnswered = yield* Deferred.make<void>();
+        const startupCheck = yield* Deferred.make<void>();
+        const fake = yield* makeGatedCodexAppServer({ handshake, usageAnswered });
+
+        // The probe times out in the handshake; the process waits for that answer.
+        fake.setStartupWork(false);
+        const timedOut = yield* check(fake.spawner);
+        yield* Deferred.await(fake.handshakeRequested);
+        yield* TestClock.adjust("21 seconds");
+        assert.match((yield* Fiber.join(timedOut)).message ?? "", /Timed out/);
+        yield* TestClock.adjust("30 seconds");
+        assert.strictEqual(fake.released(), 0);
+        yield* Deferred.succeed(handshake, undefined);
+        yield* fake.awaitStop;
+        assert.strictEqual(fake.released(), 1);
+
+        // A usage read running at the deadline keeps the process until Codex answers it, and then
+        // the startup work still has to end.
+        const slow = yield* makeGatedCodexAppServer({ handshake, usageAnswered, startupCheck });
+        const deadline = yield* check(slow.spawner);
+        yield* Deferred.await(slow.usageRequested);
+        yield* TestClock.adjust("21 seconds");
+        assert.strictEqual(
+          (yield* Fiber.join(deadline)).usageLimits?.unavailable?.message,
+          "Codex did not answer the usage request.",
+        );
+        assert.isFalse(yield* Deferred.isDone(startupCheck));
+        assert.strictEqual(slow.released(), 0);
+        yield* slow.awaitSpawn;
+        const retry = yield* check(slow.spawner);
+        yield* slow.awaitSpawn;
+        yield* Deferred.succeed(usageAnswered, undefined);
+        assert.strictEqual((yield* Fiber.join(retry)).usageLimits?.windows[0]?.usedPercent, 42);
+        yield* Deferred.await(startupCheck);
+        assert.strictEqual(slow.released(), 0);
+        slow.setStartupWork(false);
+        yield* TestClock.adjust("500 millis");
+        yield* slow.awaitStop;
+        yield* slow.awaitStop;
+        assert.strictEqual(slow.released(), 2);
+
+        // An answer that never comes holds the process for the grace only.
+        const silent = yield* makeGatedCodexAppServer({
+          handshake,
+          usageAnswered: yield* Deferred.make<void>(),
+        });
+        silent.setStartupWork(false);
+        const unanswered = yield* check(silent.spawner);
+        yield* Deferred.await(silent.usageRequested);
+        yield* TestClock.adjust("21 seconds");
+        yield* Fiber.join(unanswered);
+        yield* TestClock.adjust("55 seconds");
+        assert.strictEqual(silent.released(), 0);
+        yield* TestClock.adjust("10 seconds");
+        yield* silent.awaitStop;
+        assert.strictEqual(silent.released(), 1);
+      }),
+    );
+
+    it.effect("records the process before handling interruption during spawn", () =>
+      Effect.gen(function* () {
+        const spawnReady = yield* Deferred.make<void>();
+        const startupCheck = yield* Deferred.make<void>();
+        const fake = yield* makeGatedCodexAppServer({
+          spawnReady,
+          startupCheck,
+          handshake: yield* Deferred.make<void>(),
+          usageAnswered: yield* Deferred.make<void>(),
+        });
+        const check = yield* checkCodexProviderStatus(defaultCodexSettings).pipe(
+          Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, fake.spawner),
+          Effect.forkChild,
+        );
+        yield* fake.awaitSpawn;
+        yield* TestClock.adjust("21 seconds");
+        assert.strictEqual(check.pollUnsafe(), undefined);
+        assert.strictEqual(fake.released(), 0);
+
+        yield* Deferred.succeed(spawnReady, undefined);
+        assert.match((yield* Fiber.join(check)).message ?? "", /Timed out/);
+        yield* Deferred.await(startupCheck);
+        assert.isFalse(yield* Deferred.isDone(fake.handshakeRequested));
+        assert.strictEqual(fake.released(), 0);
+        fake.setStartupWork(false);
+        yield* TestClock.adjust("500 millis");
+        yield* fake.awaitStop;
+      }),
+    );
+
+    it.effect("does not record a refused usage answer after the probe deadline", () =>
+      Effect.gen(function* () {
+        const handshake = yield* Deferred.make<void>();
+        const usageAnswered = yield* Deferred.make<void>();
+        yield* Deferred.succeed(handshake, undefined);
+        const fake = yield* makeGatedCodexAppServer({
+          handshake,
+          usageAnswered,
+          usageReply: {
+            error: { code: -32603, message: "Codex account has no refresh token; sign in again" },
+          },
+        });
+        fake.setStartupWork(false);
+        const loginRefused = yield* Ref.make<ServerProvider["codexLoginRefusal"]>(undefined);
+        const check = yield* checkCodexProviderStatus(
+          defaultCodexSettings,
+          undefined,
+          undefined,
+          undefined,
+          loginRefused,
+        ).pipe(
+          Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, fake.spawner),
+          Effect.forkChild,
+        );
+        yield* Deferred.await(fake.usageRequested);
+        yield* TestClock.adjust("21 seconds");
+        assert.strictEqual((yield* Fiber.join(check)).auth.status, "authenticated");
+
+        yield* Deferred.succeed(usageAnswered, undefined);
+        yield* fake.awaitStop;
+        assert.isUndefined(yield* Ref.get(loginRefused));
       }),
     );
 
@@ -3904,7 +4218,7 @@ it.layer(
       }),
     );
 
-    it.effect("streams the terminal update state when it lands during a slow cache write", () =>
+    it.effect.each([false, true])("preserves cache and update state (cancel=%s)", (cancel) =>
       Effect.gen(function* () {
         const claudeDriver = ProviderDriverKind.make("claude");
         const claudeInstanceId = ProviderInstanceId.make("claude");
@@ -3921,8 +4235,21 @@ it.layer(
           slashCommands: [],
           skills: [],
         } as const satisfies ServerProvider;
-        const verifyingProvider = { ...initialProvider, checkedAt: "2026-04-14T00:01:00.000Z" };
-        const laterProvider = { ...initialProvider, checkedAt: "2026-04-14T00:02:00.000Z" };
+        const verifyingProvider = {
+          ...initialProvider,
+          checkedAt: "2026-04-14T00:01:00.000Z",
+          usageLimits: {
+            checkedAt: "2026-04-14T00:01:00.000Z",
+            windows: [{ id: "primary", kind: "session", label: "Session", usedPercent: 42 }],
+          },
+        } as const satisfies ServerProvider;
+        const laterProvider = {
+          ...initialProvider,
+          checkedAt: "2026-04-14T00:02:00.000Z",
+          status: "error",
+          auth: { status: "unauthenticated" },
+        } as const satisfies ServerProvider;
+        const currentProvider = yield* Ref.make<ServerProvider>(initialProvider);
         const changes = yield* PubSub.unbounded<ServerProvider>();
         const instance = {
           instanceId: claudeInstanceId,
@@ -3941,8 +4268,8 @@ it.layer(
                   packageName: null,
                 }),
               ),
-            getSnapshot: Effect.succeed(initialProvider),
-            refresh: Effect.succeed(initialProvider),
+            getSnapshot: Ref.get(currentProvider),
+            refresh: Ref.get(currentProvider),
             streamChanges: Stream.fromPubSub(changes),
             applyUsageLimits: () => Effect.void,
           },
@@ -3964,26 +4291,32 @@ it.layer(
         );
         const writeStarted = yield* Deferred.make<void>();
         const releaseWrite = yield* Deferred.make<void>();
-        const gatedCachePath = yield* Ref.make<string | undefined>(undefined);
+        const writeFinished = yield* Deferred.make<void>();
+        const overlappingWrite = yield* Deferred.make<void>();
+        let gatedCachePath: string | undefined;
         const layerGatedFileSystem = Layer.effect(
           FileSystem.FileSystem,
           Effect.gen(function* () {
             const fileSystem = yield* FileSystem.FileSystem;
             return {
               ...fileSystem,
+              readLink: (filePath) =>
+                Effect.gen(function* () {
+                  if (filePath === gatedCachePath && (yield* Deferred.isDone(writeStarted))) {
+                    yield* Deferred.succeed(overlappingWrite, undefined);
+                  }
+                  return yield* fileSystem.readLink(filePath);
+                }),
               rename: (from, to) =>
-                Ref.modify(gatedCachePath, (path) =>
-                  path === to ? [true, undefined] : [false, path],
-                ).pipe(
-                  Effect.flatMap((gated) =>
-                    gated
-                      ? Deferred.succeed(writeStarted, undefined).pipe(
-                          Effect.andThen(Deferred.await(releaseWrite)),
-                        )
-                      : Effect.void,
-                  ),
-                  Effect.andThen(fileSystem.rename(from, to)),
-                ),
+                Effect.gen(function* () {
+                  const gated = to === gatedCachePath && !(yield* Deferred.isDone(writeStarted));
+                  if (gated) {
+                    yield* Deferred.succeed(writeStarted, undefined);
+                    yield* Deferred.await(releaseWrite);
+                  }
+                  yield* fileSystem.rename(from, to);
+                  if (gated) yield* Deferred.succeed(writeFinished, undefined);
+                }),
             } satisfies FileSystem.FileSystem;
           }),
         ).pipe(Layer.provide(NodeServices.layer));
@@ -4007,6 +4340,7 @@ it.layer(
         yield* Effect.gen(function* () {
           const registry = yield* ProviderRegistry.ProviderRegistry;
           const config = yield* ServerConfig.ServerConfig;
+          yield* registry.refreshInstance(claudeInstanceId);
           const running = {
             status: "running",
             startedAt: "2026-04-14T00:00:30.000Z",
@@ -4034,13 +4368,12 @@ it.layer(
             Effect.forkScoped({ startImmediately: true }),
           );
 
-          yield* Ref.set(
-            gatedCachePath,
-            yield* resolveProviderStatusCachePath({
-              cacheDir: config.providerStatusCacheDir,
-              instanceId: claudeInstanceId,
-            }),
-          );
+          const filePath = yield* resolveProviderStatusCachePath({
+            cacheDir: config.providerStatusCacheDir,
+            instanceId: claudeInstanceId,
+          });
+          gatedCachePath = filePath;
+          yield* Effect.addFinalizer(() => Deferred.succeed(releaseWrite, undefined));
           yield* PubSub.publish(changes, verifyingProvider);
           yield* Deferred.await(writeStarted);
           yield* registry.setProviderMaintenanceActionState({
@@ -4048,9 +4381,34 @@ it.layer(
             action: "update",
             state: unchanged,
           });
+          yield* Ref.set(currentProvider, laterProvider);
+          const invalidation = yield* registry
+            .refreshInstance(claudeInstanceId)
+            .pipe(Effect.forkScoped({ startImmediately: true }));
+          yield* TestClock.adjust("0 millis");
+          const providerBeforeWrite = (yield* registry.getProviders)[0];
+          // If writes overlap, let the invalidation reach disk before the gated rename.
+          if (!cancel && (yield* Deferred.isDone(overlappingWrite)))
+            yield* Fiber.join(invalidation);
+          const interruption = cancel
+            ? yield* Fiber.interrupt(invalidation).pipe(
+                Effect.forkScoped({ startImmediately: true }),
+              )
+            : undefined;
+          if (cancel) yield* PubSub.publish(changes, laterProvider);
           yield* Deferred.succeed(releaseWrite, undefined);
-          // The snapshot stream is consumed in order, so this lands after the slow write publishes.
-          yield* PubSub.publish(changes, laterProvider);
+          yield* Deferred.await(writeFinished);
+          if (interruption) {
+            yield* Fiber.join(interruption);
+            assert.isTrue(Exit.hasInterrupts(yield* Fiber.await(invalidation)));
+          } else {
+            yield* Fiber.join(invalidation);
+          }
+          assert.strictEqual(providerBeforeWrite?.auth.status, "unauthenticated");
+          assert.isUndefined(providerBeforeWrite?.usageLimits);
+          const cachedProvider = yield* readProviderStatusCache(filePath);
+          assert.isUndefined(cachedProvider?.usageLimits);
+          assert.strictEqual(cachedProvider?.auth.status, "unauthenticated");
 
           const updateStateOf = (providers: ReadonlyArray<ServerProvider> | undefined) =>
             providers?.find((provider) => provider.instanceId === claudeInstanceId)?.updateState;
@@ -4356,6 +4714,11 @@ it.layer(
         const secondProbeStarted = yield* Deferred.make<void>();
         const releaseSecondProbe = yield* Deferred.make<void>();
         const allowLazySettingsStream = yield* Deferred.make<void>();
+        // The replacement driver reads its status cache while it is built; holding that read
+        // keeps the rebuild between retiring the old instance and creating the new one.
+        let holdReplacement = false;
+        const replacementHeld = yield* Deferred.make<void>();
+        const releaseReplacement = yield* Deferred.make<void>();
         const mutableServerSettings = yield* makeMutableServerSettingsService(
           decodeServerSettings(
             deepMerge(encodedDefaultServerSettings, {
@@ -4429,6 +4792,16 @@ it.layer(
               return beforeSpawn.pipe(Effect.andThen(spawner.spawn(command)));
             }),
           ),
+          Layer.updateService(FileSystem.FileSystem, (fs) => ({
+            ...fs,
+            exists: (path) =>
+              holdReplacement && /[\\/]codex\.json$/.test(path)
+                ? Deferred.succeed(replacementHeld, undefined).pipe(
+                    Effect.andThen(Deferred.await(releaseReplacement)),
+                    Effect.andThen(fs.exists(path)),
+                  )
+                : fs.exists(path),
+          })),
           Layer.provideMerge(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
           Layer.provideMerge(layerBackgroundPolicyAlwaysRun),
         );
@@ -4456,11 +4829,7 @@ it.layer(
           assert.strictEqual(initialCodex?.installed, false);
           assert.deepStrictEqual(spawnedCommands, [firstMissing]);
 
-          const pendingRebuild = yield* Stream.toPull(
-            codexSnapshots.pipe(
-              Stream.filter((provider) => provider.status === "warning" && !provider.installed),
-            ),
-          );
+          holdReplacement = true;
           yield* serverSettings.updateSettings({
             providerInstances: {
               ...disabledDefaultSlots("claudeAgent", "cursor", "grok", "opencode"),
@@ -4473,14 +4842,36 @@ it.layer(
           });
           yield* Deferred.succeed(allowLazySettingsStream, undefined);
 
+          // A refresh while the replacement is built must not prune the last checked row.
+          yield* Deferred.await(replacementHeld);
+          const duringReplacement = (yield* registry.refreshInstance(
+            ProviderInstanceId.make("codex"),
+          )).find((provider) => provider.instanceId === "codex");
+          assert.include(duringReplacement?.message ?? "", firstMissing);
+          holdReplacement = false;
+          yield* Deferred.succeed(releaseReplacement, undefined);
+
           yield* Deferred.await(secondProbeStarted);
-          yield* pendingRebuild;
+          // A rebuilt Codex instance keeps its last checked row until its own first check ends.
+          const pendingCodex = (yield* registry.getProviders).find(
+            (provider) => provider.instanceId === "codex",
+          );
+          assert.include(pendingCodex?.message ?? "", firstMissing);
           const rebuiltError = yield* Stream.toPull(
-            codexSnapshots.pipe(Stream.filter((provider) => provider.status === "error")),
+            codexSnapshots.pipe(
+              Stream.filter(
+                (provider) =>
+                  provider.status === "error" && (provider.message ?? "").includes(secondMissing),
+              ),
+            ),
           );
           yield* Deferred.succeed(releaseSecondProbe, undefined);
           const [reprobedCodex] = yield* rebuiltError;
-          assert.deepStrictEqual(spawnedCommands, [firstMissing, secondMissing]);
+          // The refresh also re-reads the login shell PATH.
+          assert.deepStrictEqual(
+            spawnedCommands.filter((command) => command.startsWith("t3code_codex_")),
+            [firstMissing, secondMissing],
+          );
           assert.strictEqual(reprobedCodex?.status, "error");
           assert.strictEqual(reprobedCodex?.installed, false);
         }).pipe(Effect.provide(runtimeServices));

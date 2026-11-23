@@ -2037,7 +2037,7 @@ export const createCodexAdapterV2 = Effect.fn("CodexAdapterV2.createCodexAdapter
   { instanceId, environment, enabled, config }: ProviderAdapterDriverCreateInput<CodexSettings>,
   hooks: Pick<
     CodexAdapterV2Options,
-    "onUsageLimits" | "resolveRuntime" | "compatibility" | "models"
+    "onUsageLimits" | "resolveRuntime" | "compatibility" | "models" | "retainAppServer"
   > = {},
 ) {
   const clientFactory = yield* CodexAppServerClientFactory;
@@ -2091,6 +2091,7 @@ export interface CodexAdapterV2Options {
   readonly environment: NodeJS.ProcessEnv;
   readonly clientFactory: CodexAppServerClientFactoryShape;
   readonly onUsageLimits?: ManagedServerProvider["applyUsageLimits"];
+  readonly retainAppServer?: Effect.Effect<void, never, Scope.Scope>;
   /** The provider's published models, read per turn for catalog defaults. */
   readonly models?: Effect.Effect<ReadonlyArray<ServerProviderModel>>;
   readonly resolveRuntime?: Effect.Effect<CodexEffectiveRuntime, ProviderSetupError, Scope.Scope>;
@@ -2146,6 +2147,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                     }),
                 ),
               );
+        if (adapterOptions.retainAppServer) yield* adapterOptions.retainAppServer;
         const client = yield* clientFactory.open({
           instanceId: adapterOptions.instanceId,
           threadId: input.threadId,

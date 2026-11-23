@@ -258,6 +258,22 @@ export const ServerProvider = Schema.Struct({
     }),
   ),
   configurableProviders: Schema.optional(Schema.Boolean),
+  /**
+   * Lowercase hex SHA-256 of the UTF-8 real path of the home reported by a completed Codex probe.
+   * Absent if the probe did not complete or the path could not be resolved.
+   */
+  homeFingerprint: Schema.optionalKey(TrimmedNonEmptyString),
+  /** The last verified login Codex refused, retained even across an inconclusive check. */
+  codexLoginRefusal: Schema.optionalKey(
+    Schema.Struct({
+      homeFingerprint: TrimmedNonEmptyString.check(Schema.isPattern(/^[a-f0-9]{64}$/)),
+      email: Schema.optionalKey(TrimmedNonEmptyString),
+      plan: Schema.optionalKey(TrimmedNonEmptyString),
+      accountId: Schema.optionalKey(TrimmedNonEmptyString),
+      workspaceId: Schema.optionalKey(TrimmedNonEmptyString),
+      authGeneration: Schema.optionalKey(TrimmedNonEmptyString),
+    }),
+  ),
   runtimePaths: Schema.optionalKey(
     Schema.Struct({
       homePath: TrimmedNonEmptyString,

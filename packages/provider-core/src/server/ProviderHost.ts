@@ -45,6 +45,8 @@ export class ProviderHost extends Context.Service<
       readonly subscribe: Effect.Effect<Stream.Stream<ServerSettings>, never, Scope.Scope>;
     };
     readonly shouldRunBackgroundWork: (scope: BackgroundScope) => Effect.Effect<boolean>;
+    /** Whether work nobody watches may run: no client needed, and a locked screen does not pause it. */
+    readonly shouldRunUnattendedWork?: Effect.Effect<boolean>;
     /** Completes once server startup finishes; first provider checks wait for it. */
     readonly awaitServerReady?: Effect.Effect<void>;
     /** Absolute attachment path, or null if the ID does not resolve inside attachmentsDir. */

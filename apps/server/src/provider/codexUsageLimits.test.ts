@@ -10,6 +10,7 @@ import {
   codexRateLimitsToLimits,
   codexRateLimitsToUpdate,
   codexTimeZone,
+  isCodexLoginRefusal,
   mergeCodexRateLimits,
 } from "./codexUsageLimits.ts";
 
@@ -246,6 +247,82 @@ describe("codexRateLimitsFailureMessage", () => {
         }),
       ),
     ).toBe("Codex could not read usage (JSON-RPC -32603).");
+  });
+});
+
+describe("isCodexLoginRefusal", () => {
+  const usageError = (errorMessage: string, data?: unknown) =>
+    new CodexErrors.CodexAppServerRequestError({
+      code: -32603,
+      errorMessage,
+      ...(data === undefined ? {} : { data }),
+    });
+  const usageFailure = (status: string, body: string) =>
+    `failed to fetch codex rate limits: GET https://chatgpt.com/backend-api/wham/usage failed: ${status}; content-type=application/json; body=${body}`;
+
+  // Bodies and messages as the service and the Codex binary word them.
+  it.each([
+    usageFailure(
+      "401 Unauthorized",
+      '{"error": {"message": "Encountered invalidated oauth token for user, failing request", "type": null, "code": "token_revoked", "param": null}, "status": 401}',
+    ),
+    usageFailure("401 Unauthorized", '{"error": {"code": "token_invalidated"}}'),
+    usageFailure("401 Unauthorized", '{\\"error\\": {\\"code\\": \\"refresh_token_reused\\"}}'),
+    "Your access token could not be refreshed because your refresh token has expired. Please log out and sign in again.",
+    "Your access token could not be refreshed because your refresh token was already used. Please log out and sign in again.",
+    "Your access token could not be refreshed because your refresh token was revoked. Please log out and sign in again.",
+    "Your access token could not be refreshed. Please log out and sign in again.",
+    "Your authentication session could not be refreshed automatically. Please log out and sign in again.",
+    "Codex account has no refresh token; sign in again",
+    "enterprise IdP identity changed; sign in again and reconnect",
+    "enterprise IdP credentials were removed; sign in again",
+    "enterprise IdP ID token is expired or invalid; sign in again",
+    usageFailure("401 Unauthorized", '{"error": {"code": "refresh_token_revoked"}}'),
+    "not logged in",
+    "not signed in",
+    usageFailure("401 Unauthorized", '{"error":{"code":"refresh_token_already_used_v2"}}'),
+  ])("treats a refused login as a refusal: %s", (message) => {
+    expect(isCodexLoginRefusal(usageError(message))).toBe(true);
+  });
+
+  it("reads a refusal code from the structured error data", () => {
+    const data = { error: { code: "refresh_token_expired" } };
+    expect(isCodexLoginRefusal(usageError("failed to fetch codex rate limits", data))).toBe(true);
+  });
+
+  it.each([
+    ["", { details: '{"code":"token_revoked"}' }],
+    ['unrelated diagnostics: {"code":"token_revoked"}', undefined],
+    [
+      usageFailure(
+        "401 Unauthorized",
+        JSON.stringify({ error: { message: '{"code":"token_revoked"}' } }),
+      ),
+      undefined,
+    ],
+  ] as const)("ignores refusal codes quoted in diagnostics: %s", (message, data) => {
+    expect(isCodexLoginRefusal(usageError(message, data))).toBe(false);
+  });
+
+  it.each([
+    usageFailure("401 Unauthorized", '{"detail": "Unauthorized"}'),
+    "could not fetch usage for a workspace the user is not logged in to",
+    "request failed because an upstream client was not signed in",
+    "enterprise IdP lookup failed; sign in again if the problem persists",
+    "The server returned an invalidated oauth token diagnostic",
+    usageFailure("401 Unauthorized", '{"error": {"code": "not_token_revoked"}}'),
+    usageFailure("500 Internal Server Error", '{"request_id": "req_4012401"}'),
+    usageFailure("429 Too Many Requests", '{"resets_at": "2026-11-22T14:01:00Z"}'),
+    // A process that outlived a re-login reports this; the current login is fine.
+    "Your access token could not be refreshed because you have since logged out or signed in to another account. Please sign in again.",
+  ])("does not treat other usage failures as a refusal: %s", (message) => {
+    expect(isCodexLoginRefusal(usageError(message))).toBe(false);
+  });
+
+  it("ignores failures that are not answers from Codex", () => {
+    expect(isCodexLoginRefusal(new CodexErrors.CodexAppServerProcessExitedError({ code: 1 }))).toBe(
+      false,
+    );
   });
 });
 

@@ -1,19 +1,27 @@
+// @effect-diagnostics nodeBuiltinImport:off - Fingerprints hash a resolved local filesystem path.
+import * as NodeCrypto from "node:crypto";
+
 import { resolveProviderProbeTimeoutMs } from "@t3tools/provider-core/server/snapshotProbe";
 import { pipe } from "effect/Function";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Equal from "effect/Equal";
 import * as Exit from "effect/Exit";
+import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
+import * as Queue from "effect/Queue";
 import * as RcMap from "effect/RcMap";
+import * as Ref from "effect/Ref";
 import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 import * as Schedule from "effect/Schedule";
 import * as Scope from "effect/Scope";
+import * as Semaphore from "effect/Semaphore";
 import * as Types from "effect/Types";
 import * as ChildProcess from "effect/process/ChildProcess";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
@@ -25,6 +33,7 @@ import type {
   CodexSettings,
   CustomModelSetting,
   ServerProvider,
+  ProviderInstanceId,
   ServerProviderState,
   ModelCapabilities,
   ProviderOptionDescriptor,
@@ -49,11 +58,18 @@ import {
   spawnAndCollect,
   type ServerProviderDraft,
 } from "@t3tools/provider-core/server/snapshotProbe";
+import {
+  ClearProviderUsage,
+  UnattendedProviderCheck,
+} from "@t3tools/provider-core/server/managedProvider";
+import * as ProviderHost from "@t3tools/provider-core/server/ProviderHost";
 import { expandHomePath } from "@t3tools/provider-core/server/pathExpansion";
 import { makeUnavailableUsageLimits } from "@t3tools/provider-core/server/usageLimits";
 import {
+  CODEX_LOGIN_REFUSED_USAGE_MESSAGE,
   codexRateLimitsFailureMessage,
   codexRateLimitsToLimits,
+  isCodexLoginRefusal,
   type CodexRateLimitSnapshot,
   type CodexResetCreditsSummary,
 } from "./codexUsageLimits.ts";
@@ -71,7 +87,7 @@ type CodexRateLimitsProbe =
       readonly resetCredits: CodexResetCreditsSummary | null | undefined;
       readonly accountId?: string | null | undefined;
     }
-  | { readonly failure: string };
+  | { readonly failure: string; readonly loginRefused?: true };
 
 const CodexRoutingConfig = Schema.Struct({
   model_provider: Schema.optionalKey(Schema.NullOr(Schema.String)),
@@ -154,10 +170,13 @@ const CODEX_PRESENTATION = {
   reportsContextWindow: true,
 } as const;
 
-export interface CodexAppServerProviderSnapshot {
-  readonly account: CodexSchema.V2GetAccountResponse;
+export interface CodexAppServerProviderSnapshot extends CodexObservedAccount {
   readonly endpoint?: string | undefined;
   readonly nativeUsage?: boolean;
+  /** `config/read` failed, so whether this login's quota is spent here is unknown. */
+  readonly configUnavailable?: boolean;
+  /** The CODEX_HOME the app-server reported; never published as a path. */
+  readonly codexHome?: string;
   readonly rateLimits?: CodexRateLimitsProbe;
   readonly version: string | undefined;
   readonly models: ReadonlyArray<ServerProviderModel> | undefined;
@@ -644,6 +663,10 @@ export const withCodexAppServerClient = Effect.fn("withCodexAppServerClient")(fu
   readonly launchArgs?: string | undefined;
   readonly cwd: string;
   readonly environment?: NodeJS.ProcessEnv | undefined;
+  readonly probe?: {
+    readonly recordPid: (pid: number) => void;
+    readonly track: ReturnType<typeof makeCodexRequestTracker>;
+  };
 }) {
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
   const environment = yield* codexProcessEnvironment(input);
@@ -652,7 +675,7 @@ export const withCodexAppServerClient = Effect.fn("withCodexAppServerClient")(fu
     codexAppServerArgs(input.launchArgs),
     { env: environment, extendEnv: true },
   );
-  const child = yield* spawner
+  const spawn = spawner
     .spawn(
       ChildProcess.make(spawnCommand.command, spawnCommand.args, {
         cwd: input.cwd,
@@ -671,10 +694,26 @@ export const withCodexAppServerClient = Effect.fn("withCodexAppServerClient")(fu
           }),
       ),
     );
+  const probe = input.probe;
+  const child = yield* probe
+    ? Effect.uninterruptible(
+        spawn.pipe(Effect.tap((child) => Effect.sync(() => probe.recordPid(child.pid)))),
+      )
+    : spawn;
   const clientContext = yield* Layer.build(CodexClient.layerChildProcess(child));
-  const client = yield* Effect.service(CodexClient.CodexAppServerClient).pipe(
+  const rawClient = yield* Effect.service(CodexClient.CodexAppServerClient).pipe(
     Effect.provide(clientContext),
   );
+  const client: CodexClient.CodexAppServerClient["Service"] = probe
+    ? {
+        ...rawClient,
+        request: (method, payload) => probe.track(rawClient.request(method, payload)),
+        raw: {
+          ...rawClient.raw,
+          request: (method, payload) => probe.track(rawClient.raw.request(method, payload)),
+        },
+      }
+    : rawClient;
   const initialize = yield* client.request("initialize", buildCodexInitializeParams());
   yield* client.notify("initialized", undefined);
   return { client, initialize, pid: child.pid };
@@ -695,6 +734,21 @@ const codexProcessGroupIsBusy = Effect.fn("codexProcessGroupIsBusy")(
   Effect.orElseSucceed(() => false),
 );
 
+// Codex may be refreshing the login and still need to write the rotated token to auth.json.
+const CODEX_IN_FLIGHT_REQUEST_GRACE = Duration.seconds(60);
+
+// The request outlives its waiter. Fork and registration must be atomic.
+const makeCodexRequestTracker =
+  (processScope: Scope.Scope, inFlight: Array<Fiber.Fiber<unknown, unknown>>) =>
+  <A, E>(effect: Effect.Effect<A, E>): Effect.Effect<A, E> =>
+    Effect.uninterruptibleMask((restore) =>
+      restore(effect).pipe(
+        Effect.forkIn(processScope),
+        Effect.tap((fiber) => Effect.sync(() => inFlight.push(fiber))),
+        Effect.flatMap((fiber) => restore(Fiber.join(fiber))),
+      ),
+    );
+
 const stopCodexAfterStartupWork = (pid: number, processScope: Scope.Closeable) =>
   codexProcessGroupIsBusy(pid).pipe(
     Effect.repeat({ schedule: Schedule.spaced("500 millis"), while: (busy) => busy }),
@@ -702,8 +756,7 @@ const stopCodexAfterStartupWork = (pid: number, processScope: Scope.Closeable) =
     Effect.ensuring(Scope.close(processScope, Exit.void)),
   );
 
-// Usage is an enrichment: a failure or a slow answer degrades to "no usage this
-// probe" rather than costing the account and models.
+// Only answers within the probe deadline are classified, even though Codex can finish afterward.
 const readCodexRateLimits = (
   client: CodexClient.CodexAppServerClient["Service"],
   deadlineMs: number,
@@ -719,14 +772,127 @@ const readCodexRateLimits = (
           }
         : { failure: "Codex did not answer the usage request." },
     ),
-    Effect.catch((error) =>
-      Effect.logDebug("Codex rate-limit read failed.", { cause: error }).pipe(
-        Effect.as<CodexRateLimitsProbe>({ failure: codexRateLimitsFailureMessage(error) }),
+    Effect.catch((error) => {
+      const loginRefused = isCodexLoginRefusal(error);
+      // The provider's text can name the account, so neither the log nor the snapshot keeps it.
+      return Effect.logDebug("Codex rate-limit read failed.", {
+        error: error._tag,
+        ...(error._tag === "CodexAppServerRequestError" ? { code: error.code } : {}),
+        loginRefused,
+      }).pipe(
+        Effect.as<CodexRateLimitsProbe>(
+          loginRefused
+            ? { failure: CODEX_LOGIN_REFUSED_USAGE_MESSAGE, loginRefused: true }
+            : { failure: codexRateLimitsFailureMessage(error) },
+        ),
+      );
+    }),
+  );
+
+type CodexLoginObservation = Pick<
+  CodexAppServerProviderSnapshot,
+  "account" | "codexHome" | "nativeUsage" | "configUnavailable" | "rateLimits"
+> &
+  Pick<NonNullable<ServerProvider["codexLoginRefusal"]>, "accountId" | "workspaceId">;
+
+const CodexAccountIdentifiers = Schema.Struct({
+  accountId: Schema.optionalKey(Schema.NullOr(Schema.String)),
+  workspaceId: Schema.optionalKey(Schema.NullOr(Schema.String)),
+  chatgptAccountId: Schema.optionalKey(Schema.NullOr(Schema.String)),
+});
+const decodeCodexAccountIdentifiers = Schema.decodeUnknownOption(
+  Schema.Struct({
+    ...CodexAccountIdentifiers.fields,
+    account: Schema.optionalKey(Schema.NullOr(CodexAccountIdentifiers)),
+  }),
+);
+const decodeCodexAccount = Schema.decodeUnknownEffect(CodexSchema.V2GetAccountResponse);
+
+interface CodexObservedAccount {
+  readonly account: CodexSchema.V2GetAccountResponse;
+  readonly accountId?: string;
+  readonly workspaceId?: string;
+}
+
+const readCodexProviderAccount = Effect.fn("readCodexProviderAccount")(function* (
+  client: CodexClient.CodexAppServerClient["Service"],
+) {
+  const raw = yield* client.raw.request("account/read", {});
+  const account = yield* decodeCodexAccount(raw).pipe(
+    Effect.mapError((cause) =>
+      CodexErrors.CodexAppServerProtocolParseError.fromSchemaError(
+        "decode-response-payload",
+        cause,
+        {
+          method: "account/read",
+        },
       ),
     ),
   );
+  const ids = Option.getOrUndefined(decodeCodexAccountIdentifiers(raw));
+  const accountId = (
+    ids?.accountId ??
+    ids?.chatgptAccountId ??
+    ids?.account?.accountId ??
+    ids?.account?.chatgptAccountId
+  )?.trim();
+  const workspaceId = (ids?.workspaceId ?? ids?.account?.workspaceId)?.trim();
+  return { account, ...(accountId ? { accountId } : {}), ...(workspaceId ? { workspaceId } : {}) };
+});
 
-const probeCodexAppServerProvider = Effect.fn("probeCodexAppServerProvider")(function* (input: {
+interface CodexProbeHome {
+  readonly reportedPath: string;
+  readonly realPath?: string;
+  readonly authGeneration?: string;
+  readonly authMetadataUnavailable?: true;
+}
+
+const resolveCodexProbeHomePath = Effect.fn("resolveCodexProbeHomePath")(function* (
+  homePath: string,
+) {
+  const fs = yield* FileSystem.FileSystem;
+  const expandedPath = expandHomePath(homePath, yield* HostProcess.HomeDirectory);
+  return yield* fs.realPath(expandedPath).pipe(Effect.option, Effect.map(Option.getOrUndefined));
+});
+
+const readCodexProbeHome = Effect.fn("readCodexProbeHome")(function* (
+  reportedPath: string,
+): Effect.fn.Return<CodexProbeHome, never, FileSystem.FileSystem | Path.Path> {
+  const fs = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const realPath = yield* resolveCodexProbeHomePath(reportedPath);
+  if (realPath === undefined) return { reportedPath };
+  const authPath = path.join(realPath, "auth.json");
+  const auth = yield* fs.stat(authPath).pipe(
+    Effect.catchReason("PlatformError", "NotFound", () => Effect.undefined),
+    Effect.option,
+  );
+  const home = { reportedPath, realPath };
+  if (Option.isNone(auth)) return { ...home, authMetadataUnavailable: true };
+  const metadata = auth.value;
+  if (!metadata) return home;
+  const ino = Option.getOrUndefined(metadata.ino);
+  const mtime = Option.getOrUndefined(metadata.mtime);
+  if (
+    metadata.type !== "File" ||
+    ino === undefined ||
+    mtime === undefined ||
+    Option.isNone(yield* fs.access(authPath, { readable: true }).pipe(Effect.option))
+  )
+    return { ...home, authMetadataUnavailable: true };
+  const authGeneration = NodeCrypto.createHash("sha256")
+    .update(`${metadata.dev}:${ino}:${metadata.size}:${mtime.getTime()}`, "utf8")
+    .digest("hex");
+  return { ...home, authGeneration };
+});
+
+const sameCredentialGeneration = (a: CodexProbeHome, b: CodexProbeHome) =>
+  a.realPath === b.realPath &&
+  (a.realPath !== undefined || a.reportedPath === b.reportedPath) &&
+  a.authGeneration === b.authGeneration &&
+  a.authMetadataUnavailable === b.authMetadataUnavailable;
+
+interface CodexProviderProbeInput {
   readonly probeTimeoutMs: number;
   readonly binaryPath: string;
   readonly homePath?: string;
@@ -734,32 +900,60 @@ const probeCodexAppServerProvider = Effect.fn("probeCodexAppServerProvider")(fun
   readonly cwd: string;
   readonly environment?: NodeJS.ProcessEnv;
   readonly skipNativeUsage?: boolean;
-}) {
+  readonly sampleHome?: (
+    reportedPath: string,
+  ) => Effect.Effect<CodexProbeHome, never, FileSystem.FileSystem | Path.Path>;
+  readonly observeLogin?: (observation: CodexLoginObservation) => void;
+}
+
+const probeCodexAppServerProvider = Effect.fn("probeCodexAppServerProvider")(function* (
+  input: CodexProviderProbeInput,
+  ownProcessScope?: (scope: Scope.Scope) => Effect.Effect<void>,
+) {
   const spawnedAtMs = DateTime.toEpochMillis(yield* DateTime.now);
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
-  const processScope = yield* Scope.make();
+  const inFlight: Array<Fiber.Fiber<unknown, unknown>> = [];
   let pid: number | undefined;
-  // Returning the snapshot must not wait for Codex's own startup work.
-  yield* Effect.addFinalizer(() =>
-    pid === undefined
-      ? Scope.close(processScope, Exit.void)
-      : stopCodexAfterStartupWork(pid, processScope).pipe(
-          Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
-          Effect.forkDetach,
-          Effect.asVoid,
-        ),
+  const processScope = yield* Effect.uninterruptible(
+    Effect.gen(function* () {
+      const childScope = yield* Scope.make();
+      // Teardown can outlive the refresh semaphore, but the instance stays busy until it closes.
+      yield* Effect.addFinalizer(() =>
+        pid === undefined
+          ? Scope.close(childScope, Exit.void)
+          : Fiber.awaitAll(inFlight).pipe(
+              Effect.timeoutOption(CODEX_IN_FLIGHT_REQUEST_GRACE),
+              Effect.andThen(stopCodexAfterStartupWork(pid, childScope)),
+              Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+              Effect.forkDetach({ startImmediately: true }),
+              Effect.asVoid,
+            ),
+      );
+      if (ownProcessScope) yield* ownProcessScope(childScope);
+      return childScope;
+    }),
   );
-  const opened = yield* withCodexAppServerClient(input).pipe(Scope.provide(processScope));
-  pid = opened.pid;
-  const { client, initialize } = opened;
+  const { client, initialize } = yield* withCodexAppServerClient({
+    ...input,
+    probe: {
+      recordPid: (spawned) => {
+        pid = spawned;
+      },
+      track: makeCodexRequestTracker(processScope, inFlight),
+    },
+  }).pipe(Scope.provide(processScope));
 
   const versionMatch = initialize.userAgent.match(/\/([^\s]+)/);
   const version = versionMatch ? versionMatch[1] : undefined;
 
-  const accountResponse = yield* client.request("account/read", {});
+  if (input.sampleHome) yield* input.sampleHome(initialize.codexHome);
+  const observedAccount = yield* readCodexProviderAccount(client);
+  const { account: accountResponse } = observedAccount;
+  const login = { ...observedAccount, codexHome: initialize.codexHome };
+  input.observeLogin?.(login);
   if (!accountResponse.account && accountResponse.requiresOpenaiAuth) {
     return {
-      account: accountResponse,
+      ...login,
       version,
       models: [],
       skills: [],
@@ -768,17 +962,22 @@ const probeCodexAppServerProvider = Effect.fn("probeCodexAppServerProvider")(fun
 
   // Optional discovery must finish before the outer timeout can discard the account result.
   const deadlineMs = spawnedAtMs + input.probeTimeoutMs - CODEX_DISCOVERY_MARGIN_MS;
-  const [skillsResponse, models, { config, nativeUsage, rateLimits }] = yield* Effect.all(
+  const [skillsResult, modelsResult, route] = yield* Effect.all(
     [
-      withCodexDiscoveryDeadline(client.request("skills/list", { cwds: [input.cwd] }), deadlineMs),
-      accountResponse.account?.type === "chatgpt"
+      // Discovery failure must let the deadline-bound usage read finish.
+      withCodexDiscoveryDeadline(
+        client.request("skills/list", { cwds: [input.cwd] }),
+        deadlineMs,
+      ).pipe(Effect.result),
+      (accountResponse.account?.type === "chatgpt"
         ? requestCodexChatGptModels({
             client,
             codexHome: initialize.codexHome,
             spawnedAtMs,
             deadlineMs,
           })
-        : withCodexDiscoveryDeadline(requestAllCodexModels(client), deadlineMs),
+        : withCodexDiscoveryDeadline(requestAllCodexModels(client), deadlineMs)
+      ).pipe(Effect.result),
       // The shared catalog must exclude config from the server's launch project.
       withCodexDiscoveryDeadline(
         client.request("config/read", { includeLayers: false }),
@@ -792,15 +991,24 @@ const probeCodexAppServerProvider = Effect.fn("probeCodexAppServerProvider")(fun
             !input.skipNativeUsage &&
             config !== undefined &&
             codexRoutesSpendNativeQuota(accountResponse, config.config);
+          const configUnavailable =
+            config === undefined &&
+            !input.skipNativeUsage &&
+            accountResponse.requiresOpenaiAuth &&
+            accountResponse.account?.type === "chatgpt";
           const readUsage: Effect.Effect<CodexRateLimitsProbe | undefined> = nativeUsage
             ? readCodexRateLimits(client, deadlineMs)
             : Effect.undefined;
           return readUsage.pipe(
-            Effect.map((rateLimits) => ({
-              config: config?.config,
-              nativeUsage,
-              rateLimits,
-            })),
+            Effect.map((rateLimits) => {
+              input.observeLogin?.({
+                ...login,
+                nativeUsage,
+                configUnavailable,
+                ...(rateLimits ? { rateLimits } : {}),
+              });
+              return { config: config?.config, nativeUsage, configUnavailable, rateLimits };
+            }),
           );
         }),
       ),
@@ -808,14 +1016,19 @@ const probeCodexAppServerProvider = Effect.fn("probeCodexAppServerProvider")(fun
     { concurrency: "unbounded" },
   );
 
+  if (Result.isFailure(skillsResult)) return yield* skillsResult.failure;
+  if (Result.isFailure(modelsResult)) return yield* modelsResult.failure;
+  const skillsResponse = skillsResult.success;
+  const { config, nativeUsage, configUnavailable, rateLimits } = route;
   const cyberAccess = Option.getOrUndefined(decodeCodexCyberAccessConfig(config));
   return {
-    account: accountResponse,
+    ...login,
     endpoint: config ? codexCustomEndpoint(config) : undefined,
     nativeUsage,
+    configUnavailable,
     ...(rateLimits ? { rateLimits } : {}),
     version,
-    models,
+    models: modelsResult.success,
     serviceTier: config?.service_tier ?? undefined,
     daybreakEnabled: config === undefined ? undefined : cyberAccess?.daybreak === true,
     // An unread config cannot rule out an API key with the programs turned off.
@@ -884,7 +1097,9 @@ export const probeCodexSkillsForCwd = Effect.fn("probeCodexSkillsForCwd")(functi
 const CODEX_SKILLS_HELPER_IDLE_TTL = "30 seconds";
 
 /** Reuses one app-server per launch identity; each read passes its cwd and rescans from disk. */
-export const makeCodexSkillsProbe = Effect.fn("makeCodexSkillsProbe")(function* () {
+export const makeCodexSkillsProbe = Effect.fn("makeCodexSkillsProbe")(function* (
+  retainAppServer: Effect.Effect<void, never, Scope.Scope> = Effect.void,
+) {
   const helpers = yield* RcMap.make({
     lookup: (launch: {
       readonly binaryPath: string;
@@ -892,7 +1107,8 @@ export const makeCodexSkillsProbe = Effect.fn("makeCodexSkillsProbe")(function* 
       readonly launchArgs?: string;
       readonly environment: NodeJS.ProcessEnv;
     }) =>
-      withCodexAppServerClient({ ...launch, cwd: process.cwd() }).pipe(
+      retainAppServer.pipe(
+        Effect.andThen(withCodexAppServerClient({ ...launch, cwd: process.cwd() })),
         Effect.map(({ client }) => client),
       ),
     idleTimeToLive: CODEX_SKILLS_HELPER_IDLE_TTL,
@@ -970,8 +1186,11 @@ const makePendingCodexProvider = Effect.fn("CodexProvider.makePendingCodexProvid
 const quotePath = Schema.encodeSync(Schema.fromJsonString(Schema.String));
 
 function accountProbeStatus(
-  { account, rateLimits }: CodexAppServerProviderSnapshot,
+  account: CodexSchema.V2GetAccountResponse,
   codexHome: string | undefined,
+  loginRefused: boolean,
+  workspaceId: string | undefined,
+  rateLimits: CodexRateLimitsProbe | undefined,
 ): {
   readonly status: Exclude<ServerProviderState, "disabled">;
   readonly auth: ServerProvider["auth"];
@@ -982,8 +1201,6 @@ function accountProbeStatus(
     rateLimits && "snapshot" in rateLimits ? rateLimits.snapshot.planType : undefined,
   );
   const authEmail = codexAccountEmail(account.account);
-  const workspaceId =
-    rateLimits && "accountId" in rateLimits ? rateLimits.accountId?.trim() : undefined;
   const auth = {
     status: account.account ? ("authenticated" as const) : ("unknown" as const),
     ...(account.account?.type ? { type: account.account?.type } : {}),
@@ -991,6 +1208,14 @@ function accountProbeStatus(
     ...(authEmail ? { email: authEmail } : {}),
     ...(workspaceId ? { workspaceId } : {}),
   } satisfies ServerProvider["auth"];
+
+  if (loginRefused) {
+    return {
+      status: "error",
+      auth: { ...auth, status: "unauthenticated" },
+      message: codexLoginRefusedMessage(codexHome),
+    };
+  }
 
   if (account.account) {
     return { status: "ready", auth };
@@ -1009,23 +1234,49 @@ function accountProbeStatus(
   return { status: "ready", auth };
 }
 
+const codexLoginRefusedMessage = (codexHome: string | undefined) =>
+  codexHome
+    ? `The service refused this Codex login. Run \`codex login\` with CODEX_HOME set to ${quotePath(codexHome)} and try again.`
+    : "The service refused this Codex login. Run `codex login` and try again.";
+
+const CODEX_CONFIG_UNAVAILABLE_USAGE_MESSAGE =
+  "Codex did not return its configuration in time, so usage was not read.";
+
+type CodexLoginRefusal = ServerProvider["codexLoginRefusal"];
+
+const loginRefusedAfter = (observation: CodexLoginObservation): boolean | undefined => {
+  const { account, nativeUsage, configUnavailable, rateLimits } = observation;
+  if (account.account?.type !== "chatgpt" || (nativeUsage === false && !configUnavailable))
+    return false;
+  if (!rateLimits) return undefined;
+  return "snapshot" in rateLimits ? false : rateLimits.loginRefused;
+};
+
+const fingerprintCodexHome = (path: string | undefined) =>
+  path && NodeCrypto.createHash("sha256").update(path, "utf8").digest("hex");
+
+const loginFields = [
+  "homeFingerprint",
+  "email",
+  "plan",
+  "accountId",
+  "workspaceId",
+  "authGeneration",
+] as const;
+
 export const checkCodexProviderStatus = Effect.fn("checkCodexProviderStatus")(function* (
   codexSettings: CodexSettings,
-  probe: (input: {
-    readonly probeTimeoutMs: number;
-    readonly binaryPath: string;
-    readonly homePath?: string;
-    readonly launchArgs?: string;
-    readonly cwd: string;
-    readonly environment?: NodeJS.ProcessEnv;
-    readonly skipNativeUsage?: boolean;
-  }) => Effect.Effect<
+  probe: (
+    input: CodexProviderProbeInput,
+  ) => Effect.Effect<
     CodexAppServerProviderSnapshot,
     CodexErrors.CodexAppServerError,
     ChildProcessSpawner.ChildProcessSpawner | FileSystem.FileSystem | Path.Path | Scope.Scope
   > = probeCodexAppServerProvider,
   environment?: NodeJS.ProcessEnv,
   managedAuth?: ServerProvider["auth"],
+  loginRefusedState?: Ref.Ref<CodexLoginRefusal>,
+  credentials?: CodexCredentialMonitor,
 ): Effect.fn.Return<
   ServerProviderDraft,
   ServerSettingsError,
@@ -1057,6 +1308,22 @@ export const checkCodexProviderStatus = Effect.fn("checkCodexProviderStatus")(fu
     CODEX_AUTH_PROBE_TIMEOUT_MS,
     resolvedEnvironment,
   );
+  let observedLogin: CodexLoginObservation | undefined;
+  let initializedHome: CodexProbeHome | undefined;
+  const clearUsage = yield* ClearProviderUsage;
+  const launchHome = credentials ? yield* credentials.sample(clearUsage) : undefined;
+  const sampleHome = Effect.fn("sampleCodexProbeHome")(function* (
+    reportedPath: string,
+  ): Effect.fn.Return<CodexProbeHome, never, FileSystem.FileSystem | Path.Path> {
+    if (!credentials) return yield* readCodexProbeHome(reportedPath);
+    const configured = yield* credentials.sample(clearUsage);
+    const reportedRealPath = yield* resolveCodexProbeHomePath(reportedPath);
+    if (reportedRealPath !== undefined && reportedRealPath === configured.realPath) {
+      return { ...configured, reportedPath };
+    }
+    yield* clearUsage;
+    return { reportedPath, authMetadataUnavailable: true };
+  });
   const probeResult = yield* probe({
     probeTimeoutMs,
     binaryPath: codexSettings.binaryPath,
@@ -1064,18 +1331,31 @@ export const checkCodexProviderStatus = Effect.fn("checkCodexProviderStatus")(fu
     launchArgs: resolveCodexLaunchArgs(codexSettings.launchArgs, resolvedEnvironment),
     cwd: process.cwd(),
     environment: resolvedEnvironment,
-    ...(managedAuth ? { skipNativeUsage: true } : {}),
+    sampleHome: (reportedPath) =>
+      sampleHome(reportedPath).pipe(
+        Effect.tap((home) =>
+          Effect.sync(() => {
+            initializedHome = home;
+          }),
+        ),
+      ),
+    ...(managedAuth
+      ? { skipNativeUsage: true }
+      : {
+          observeLogin: (observation) => {
+            observedLogin = observation;
+          },
+        }),
   }).pipe(
     // Process teardown can outlast the work budget without discarding a completed snapshot.
     Effect.timeoutOption(Duration.millis(probeTimeoutMs)),
     Effect.scoped,
     Effect.result,
   );
-
-  if (Result.isFailure(probeResult)) {
-    const error = probeResult.failure;
-    const installed = !isCodexAppServerSpawnError(error);
-    const version = installed
+  const probeFailure = Result.isFailure(probeResult) ? probeResult.failure : undefined;
+  const installed = probeFailure === undefined || !isCodexAppServerSpawnError(probeFailure);
+  const fallbackVersion =
+    probeFailure !== undefined && installed
       ? yield* probeCodexCliVersion({
           binaryPath: codexSettings.binaryPath,
           homePath: codexSettings.homePath,
@@ -1083,72 +1363,198 @@ export const checkCodexProviderStatus = Effect.fn("checkCodexProviderStatus")(fu
           environment: resolvedEnvironment,
         })
       : null;
-    return buildServerProvider({
-      presentation: CODEX_PRESENTATION,
-      enabled: codexSettings.enabled,
-      checkedAt,
-      models: emptyModels,
-      skills: [],
-      probe: {
-        installed,
-        version,
-        status: "error",
-        auth: { status: "unknown" },
-        message: installed
-          ? `Codex app-server provider probe failed: ${error.message}.`
-          : `Could not start Codex CLI (\`${codexSettings.binaryPath}\`). Check Settings → Providers → Codex → Binary path on the server.` +
-            (codexSettings.binaryPath === "codex"
-              ? " Installing ChatGPT or Codex desktop may not add codex to PATH."
-              : " Make sure the configured executable exists and can be run."),
-      },
-    });
+  const completed = Result.isSuccess(probeResult)
+    ? Option.getOrUndefined(probeResult.success)
+    : undefined;
+  const observation = observedLogin ?? completed;
+  const reportedHome = initializedHome?.reportedPath ?? observation?.codexHome;
+  const currentHome = reportedHome ? yield* sampleHome(reportedHome) : undefined;
+  if (!reportedHome && credentials) yield* credentials.sample(clearUsage);
+  // App-server can load credentials before it answers initialize.
+  const changedDuringLaunch =
+    launchHome !== undefined &&
+    initializedHome !== undefined &&
+    !sameCredentialGeneration(launchHome, initializedHome);
+  const generationChanged =
+    changedDuringLaunch ||
+    (initializedHome !== undefined &&
+      (currentHome === undefined ||
+        currentHome.authMetadataUnavailable === true ||
+        !sameCredentialGeneration(initializedHome, currentHome)));
+  const homeFingerprint = fingerprintCodexHome(currentHome?.realPath);
+  const verifiedHome =
+    !generationChanged && initializedHome?.authGeneration !== undefined
+      ? initializedHome
+      : undefined;
+  const refusal = observation && !generationChanged ? loginRefusedAfter(observation) : undefined;
+  const account = generationChanged ? undefined : observation?.account.account;
+  const email = codexAccountEmail(account)?.trim().toLowerCase();
+  const plan = account?.type === "chatgpt" ? account.planType.trim() : undefined;
+  const accountId = account?.type === "chatgpt" ? observedLogin?.accountId : undefined;
+  const workspaceId = account?.type === "chatgpt" ? observedLogin?.workspaceId : undefined;
+  const authGeneration = currentHome?.authGeneration;
+  const identity = { homeFingerprint, email, plan, accountId, workspaceId, authGeneration };
+  const verifiedLogin =
+    !generationChanged &&
+    homeFingerprint &&
+    plan &&
+    (email || accountId || workspaceId) &&
+    authGeneration &&
+    authGeneration === initializedHome?.authGeneration;
+  const stickyRefusal = loginRefusedState
+    ? yield* Ref.updateAndGet(loginRefusedState, (previous) => {
+        if (refusal === true && verifiedLogin) {
+          return {
+            homeFingerprint,
+            plan,
+            authGeneration,
+            ...(email ? { email } : {}),
+            ...(accountId ? { accountId } : {}),
+            ...(workspaceId ? { workspaceId } : {}),
+          };
+        }
+        if (
+          refusal === false ||
+          (currentHome?.realPath && previous && previous.homeFingerprint !== homeFingerprint) ||
+          (currentHome?.realPath &&
+            !currentHome.authMetadataUnavailable &&
+            previous?.authGeneration &&
+            previous.authGeneration !== currentHome.authGeneration) ||
+          loginFields.some(
+            (field) =>
+              previous?.[field] !== undefined &&
+              identity[field] !== undefined &&
+              previous[field] !== identity[field],
+          )
+        )
+          return undefined;
+        return previous;
+      })
+    : undefined;
+  const activeRefusal =
+    stickyRefusal !== undefined &&
+    Boolean(verifiedLogin) &&
+    stickyRefusal.plan !== undefined &&
+    stickyRefusal.authGeneration !== undefined &&
+    loginFields.every(
+      (field) => stickyRefusal[field] === undefined || stickyRefusal[field] === identity[field],
+    );
+  const loginRefused = refusal === true || activeRefusal;
+  const loginUnverified =
+    generationChanged || (stickyRefusal !== undefined && !activeRefusal && refusal !== true);
+  const refusalField = stickyRefusal ? { codexLoginRefusal: stickyRefusal } : {};
+  const refusalUsage = loginRefused
+    ? {
+        usageLimits: makeUnavailableUsageLimits({
+          checkedAt,
+          reason: "probeFailed",
+          message: CODEX_LOGIN_REFUSED_USAGE_MESSAGE,
+        }),
+      }
+    : {};
+  const configuredHome = codexSettings.homePath
+    ? completed
+      ? expandHomePath(codexSettings.homePath, yield* HostProcess.HomeDirectory)
+      : (observation?.codexHome ?? codexSettings.homePath)
+    : undefined;
+
+  if (Result.isFailure(probeResult)) {
+    const error = probeResult.failure;
+    return {
+      ...buildServerProvider({
+        presentation: CODEX_PRESENTATION,
+        enabled: codexSettings.enabled,
+        checkedAt,
+        models: emptyModels,
+        skills: [],
+        probe: {
+          installed,
+          version: fallbackVersion,
+          status: "error",
+          auth: { status: loginRefused ? "unauthenticated" : "unknown" },
+          ...refusalUsage,
+          message: installed
+            ? loginRefused
+              ? codexLoginRefusedMessage(configuredHome)
+              : `Codex app-server provider probe failed: ${error.message}.`
+            : `Could not start Codex CLI (\`${codexSettings.binaryPath}\`). Check Settings → Providers → Codex → Binary path on the server.` +
+              (codexSettings.binaryPath === "codex"
+                ? " Installing ChatGPT or Codex desktop may not add codex to PATH."
+                : " Make sure the configured executable exists and can be run."),
+        },
+      }),
+      ...refusalField,
+    };
   }
 
   if (Option.isNone(probeResult.success)) {
-    return buildServerProvider({
-      presentation: CODEX_PRESENTATION,
-      enabled: codexSettings.enabled,
-      checkedAt,
-      models: emptyModels,
-      skills: [],
-      probe: {
-        installed: true,
-        version: null,
-        status: "error",
-        auth: { status: "unknown" },
-        message: "Timed out while checking Codex app-server provider status.",
-      },
-    });
+    return {
+      ...buildServerProvider({
+        presentation: CODEX_PRESENTATION,
+        enabled: codexSettings.enabled,
+        checkedAt,
+        models: emptyModels,
+        skills: [],
+        probe: {
+          installed: true,
+          version: null,
+          status: "error",
+          auth: { status: loginRefused ? "unauthenticated" : "unknown" },
+          ...refusalUsage,
+          message: loginRefused
+            ? codexLoginRefusedMessage(configuredHome)
+            : "Timed out while checking Codex app-server provider status.",
+        },
+      }),
+      ...refusalField,
+    };
   }
 
   const snapshot = probeResult.success.value;
+  if (verifiedHome) credentials?.verify(verifiedHome);
+  const rateLimits = generationChanged ? undefined : snapshot.rateLimits;
+  const usageWorkspaceId =
+    rateLimits && "accountId" in rateLimits ? rateLimits.accountId?.trim() || undefined : undefined;
+  const publishedWorkspaceId = snapshot.workspaceId ?? usageWorkspaceId;
   const accountStatus = managedAuth
     ? { status: "ready" as const, auth: managedAuth, message: undefined }
     : accountProbeStatus(
-        snapshot,
-        codexSettings.homePath
-          ? expandHomePath(codexSettings.homePath, yield* HostProcess.HomeDirectory)
-          : undefined,
+        snapshot.account,
+        configuredHome,
+        loginRefused,
+        publishedWorkspaceId,
+        rateLimits,
       );
-  // Sign-in guidance still applies when Codex itself says it needs an OpenAI login.
+  const conflictingWorkspace =
+    usageWorkspaceId !== undefined &&
+    snapshot.workspaceId !== undefined &&
+    usageWorkspaceId !== snapshot.workspaceId;
+  const unavailableMessage = loginRefused
+    ? CODEX_LOGIN_REFUSED_USAGE_MESSAGE
+    : conflictingWorkspace
+      ? "Codex reported different workspaces for the login and its usage."
+      : (accountStatus.message ??
+        (snapshot.configUnavailable ? CODEX_CONFIG_UNAVAILABLE_USAGE_MESSAGE : undefined) ??
+        (rateLimits && "failure" in rateLimits ? rateLimits.failure : undefined));
   const usageLimits =
-    !snapshot.nativeUsage && !accountStatus.message
-      ? makeUnavailableUsageLimits({ checkedAt, reason: "unsupported" })
-      : snapshot.rateLimits === undefined || "failure" in snapshot.rateLimits
-        ? makeUnavailableUsageLimits({
-            checkedAt,
-            reason: "probeFailed",
-            ...(accountStatus.message ? { message: accountStatus.message } : {}),
-            ...(snapshot.rateLimits ? { message: snapshot.rateLimits.failure } : {}),
-          })
-        : codexRateLimitsToLimits({
-            snapshot: snapshot.rateLimits.snapshot,
-            rateLimitsByLimitId: snapshot.rateLimits.rateLimitsByLimitId,
-            resetCredits: snapshot.rateLimits.resetCredits,
-            checkedAt,
-          });
+    managedAuth || loginUnverified || (!verifiedHome && rateLimits && "snapshot" in rateLimits)
+      ? undefined
+      : !snapshot.nativeUsage && !snapshot.configUnavailable && !accountStatus.message
+        ? makeUnavailableUsageLimits({ checkedAt, reason: "unsupported" })
+        : rateLimits === undefined || "failure" in rateLimits || conflictingWorkspace
+          ? makeUnavailableUsageLimits({
+              checkedAt,
+              reason: "probeFailed",
+              ...(unavailableMessage ? { message: unavailableMessage } : {}),
+            })
+          : codexRateLimitsToLimits({
+              snapshot: rateLimits.snapshot,
+              rateLimitsByLimitId: rateLimits.rateLimitsByLimitId,
+              resetCredits: rateLimits.resetCredits,
+              checkedAt,
+            });
 
-  return buildServerProvider({
+  const provider = buildServerProvider({
     presentation: CODEX_PRESENTATION,
     enabled: codexSettings.enabled,
     checkedAt,
@@ -1175,18 +1581,198 @@ export const checkCodexProviderStatus = Effect.fn("checkCodexProviderStatus")(fu
     probe: {
       installed: true,
       version: snapshot.version ?? null,
-      status: snapshot.models === undefined ? "warning" : accountStatus.status,
-      auth: snapshot.endpoint
-        ? { ...accountStatus.auth, endpoint: snapshot.endpoint }
-        : accountStatus.auth,
+      status:
+        accountStatus.auth.status === "unauthenticated" || snapshot.models !== undefined
+          ? accountStatus.status
+          : "warning",
+      auth: loginUnverified
+        ? { status: "unknown" }
+        : snapshot.endpoint
+          ? { ...accountStatus.auth, endpoint: snapshot.endpoint }
+          : accountStatus.auth,
       ...(accountStatus.message
         ? { message: accountStatus.message }
         : snapshot.models === undefined
           ? { message: "Codex did not return its model catalog in time." }
           : {}),
-      ...(managedAuth ? {} : { usageLimits }),
+      ...(usageLimits ? { usageLimits } : {}),
     },
   });
+  return {
+    ...provider,
+    ...refusalField,
+    ...(verifiedHome && homeFingerprint ? { homeFingerprint } : {}),
+  };
 });
+
+// A replacement driver can start before the retired driver's detached process stops.
+const activeCodexStatusProbes = new WeakMap<
+  ProviderHost.ProviderHost["Service"],
+  Map<ProviderInstanceId, Deferred.Deferred<void>>
+>();
+const liveCodexAppServers = new WeakMap<
+  ProviderHost.ProviderHost["Service"],
+  Map<ProviderInstanceId, number>
+>();
+
+export const retainInstanceCodexAppServer = Effect.fn("retainInstanceCodexAppServer")(function* (
+  instanceId: ProviderInstanceId,
+) {
+  const host = yield* ProviderHost.ProviderHost;
+  const live = liveCodexAppServers.get(host) ?? new Map<ProviderInstanceId, number>();
+  liveCodexAppServers.set(host, live);
+  yield* Effect.acquireRelease(
+    Effect.sync(() => live.set(instanceId, (live.get(instanceId) ?? 0) + 1)),
+    () =>
+      Effect.sync(() => {
+        const remaining = (live.get(instanceId) ?? 1) - 1;
+        if (remaining === 0) live.delete(instanceId);
+        else live.set(instanceId, remaining);
+      }),
+  );
+});
+
+export const awaitInstanceCodexStatusProbe = Effect.fn("awaitInstanceCodexStatusProbe")(function* (
+  instanceId: ProviderInstanceId,
+) {
+  const host = yield* ProviderHost.ProviderHost;
+  const active = activeCodexStatusProbes.get(host)?.get(instanceId);
+  if (active) yield* Deferred.await(active);
+});
+
+export const makeCodexCredentialRefresh = Effect.fn("makeCodexCredentialRefresh")(function* (
+  instanceId: ProviderInstanceId,
+  refresh: Effect.Effect<unknown>,
+) {
+  const requests = yield* Queue.sliding<void>(1);
+  yield* Effect.gen(function* () {
+    yield* Queue.take(requests);
+    yield* awaitInstanceCodexStatusProbe(instanceId);
+    yield* Queue.clear(requests);
+    yield* refresh;
+  }).pipe(Effect.ignoreCause({ log: true }), Effect.forever, Effect.forkScoped);
+  return Queue.offer(requests, undefined).pipe(Effect.asVoid);
+});
+
+type CodexCredentialMonitor = Effect.Success<ReturnType<typeof makeCodexCredentialMonitor>>;
+
+export const makeCodexCredentialMonitor = Effect.fn("makeCodexCredentialMonitor")(function* (
+  homePath: string,
+) {
+  const services = yield* Effect.context<FileSystem.FileSystem | Path.Path>();
+  let observed = yield* readCodexProbeHome(homePath);
+  let verified: CodexProbeHome | undefined;
+  let followingUp = false;
+  const requests = yield* Queue.sliding<void>(1);
+  const samplePermit = yield* Semaphore.make(1);
+  const sample = Effect.fn("CodexCredentialMonitor.sample")(
+    function* (clearUsage: Effect.Effect<void>) {
+      const home = yield* readCodexProbeHome(homePath);
+      const changed = !sameCredentialGeneration(observed, home);
+      observed = home;
+      if (changed) {
+        verified = undefined;
+        yield* clearUsage;
+        if (!followingUp) yield* Queue.offer(requests, undefined);
+      }
+      return home;
+    },
+    Effect.provide(services),
+    samplePermit.withPermits(1),
+  );
+  const isCurrent = () => verified !== undefined && sameCredentialGeneration(verified, observed);
+  const run = Effect.fn("CodexCredentialMonitor.run")(function* (
+    instanceId: ProviderInstanceId,
+    refresh: Effect.Effect<unknown>,
+  ) {
+    const wait = awaitInstanceCodexStatusProbe(instanceId);
+    yield* Effect.gen(function* () {
+      yield* Queue.take(requests);
+      yield* wait;
+      yield* Queue.clear(requests);
+      if (isCurrent()) return;
+
+      // The probe and its teardown still invalidate usage, but cannot queue another follow-up.
+      followingUp = true;
+      yield* refresh.pipe(
+        Effect.ignoreCause({ log: true }),
+        Effect.andThen(wait),
+        Effect.ensuring(
+          Effect.sync(() => {
+            followingUp = false;
+          }),
+        ),
+      );
+    }).pipe(Effect.ignoreCause({ log: true }), Effect.forever, Effect.forkScoped);
+  });
+  return {
+    sample,
+    run,
+    isCurrent,
+    verify: (home: CodexProbeHome) => {
+      verified = home;
+    },
+  };
+});
+
+export const checkInstanceCodexProviderStatus = Effect.fn("checkInstanceCodexProviderStatus")(
+  function* (
+    instanceId: ProviderInstanceId,
+    settings: CodexSettings,
+    environment: NodeJS.ProcessEnv,
+    options: {
+      readonly loginRefusedState?: Ref.Ref<CodexLoginRefusal>;
+      readonly managedAuth?: ServerProvider["auth"];
+      readonly credentials?: CodexCredentialMonitor;
+    },
+  ) {
+    // A disabled check spawns nothing, so it need not wait for an earlier probe to close.
+    if (!settings.enabled) return yield* checkCodexProviderStatus(settings);
+    const host = yield* ProviderHost.ProviderHost;
+    const unattended = yield* UnattendedProviderCheck;
+    const clearUsage = yield* ClearProviderUsage;
+    const sample = options.credentials?.sample(clearUsage) ?? Effect.void;
+    const active =
+      activeCodexStatusProbes.get(host) ?? new Map<ProviderInstanceId, Deferred.Deferred<void>>();
+    activeCodexStatusProbes.set(host, active);
+
+    return yield* Effect.uninterruptibleMask((restore) =>
+      Effect.gen(function* () {
+        if (
+          active.has(instanceId) ||
+          (unattended && liveCodexAppServers.get(host)?.has(instanceId))
+        ) {
+          yield* restore(sample);
+          return undefined;
+        }
+        const stopped = Deferred.makeUnsafe<void>();
+        active.set(instanceId, stopped);
+        const release = Effect.sync(() => active.delete(instanceId)).pipe(
+          Effect.andThen(Deferred.succeed(stopped, undefined)),
+        );
+        let processOwnsRelease = false;
+        return yield* restore(
+          checkCodexProviderStatus(
+            settings,
+            (input) =>
+              probeCodexAppServerProvider(input, (scope) =>
+                Scope.addFinalizer(scope, sample.pipe(Effect.ensuring(release))).pipe(
+                  Effect.tap(() =>
+                    Effect.sync(() => {
+                      processOwnsRelease = true;
+                    }),
+                  ),
+                ),
+              ),
+            environment,
+            options.managedAuth,
+            options.loginRefusedState,
+            options.credentials,
+          ),
+        ).pipe(Effect.ensuring(Effect.suspend(() => (processOwnsRelease ? Effect.void : release))));
+      }),
+    );
+  },
+);
 
 export { makePendingCodexProvider };

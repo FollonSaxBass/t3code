@@ -77,19 +77,21 @@ export const hydrateCachedProvider = (input: {
   }
 
   const { message: _fallbackMessage, ...fallbackWithoutMessage } = input.fallbackProvider;
+  const awaitingRefusalVerification =
+    input.cachedProvider.driver === "codex" && input.cachedProvider.codexLoginRefusal !== undefined;
   const hydratedProvider: ServerProvider = {
     ...fallbackWithoutMessage,
     models: mergeProviderModels(input.fallbackProvider.models, input.cachedProvider.models),
     installed: input.cachedProvider.installed,
     version: input.cachedProvider.version,
     status: input.cachedProvider.status,
-    auth: input.cachedProvider.auth,
+    auth: awaitingRefusalVerification ? { status: "unknown" } : input.cachedProvider.auth,
     checkedAt: input.cachedProvider.checkedAt,
     slashCommands: input.cachedProvider.slashCommands,
     skills: input.cachedProvider.skills,
   };
 
-  return input.cachedProvider.message
+  return !awaitingRefusalVerification && input.cachedProvider.message
     ? { ...hydratedProvider, message: input.cachedProvider.message }
     : hydratedProvider;
 };

@@ -8,11 +8,14 @@ import {
 } from "@t3tools/contracts";
 import { createModelCapabilities } from "@t3tools/shared/model";
 import * as Cache from "effect/Cache";
+import * as Clock from "effect/Clock";
 import * as Deferred from "effect/Deferred";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as PubSub from "effect/PubSub";
+import * as Random from "effect/Random";
 import * as Ref from "effect/Ref";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
@@ -99,6 +102,7 @@ const refreshedSnapshotSecond: ServerProvider = {
 
 function layerProviderHost(input: {
   readonly runBackgroundWork: boolean;
+  readonly hostAllowsWork?: boolean | Effect.Effect<boolean>;
   readonly settings?: Pick<ProviderHost.ProviderHost["Service"], "settings">["settings"];
   readonly awaitServerReady?: Effect.Effect<void>;
 }) {
@@ -120,6 +124,14 @@ function layerProviderHost(input: {
         subscribe: Effect.succeed(Stream.empty),
       },
       shouldRunBackgroundWork: () => Effect.succeed(input.runBackgroundWork),
+      ...(input.hostAllowsWork === undefined
+        ? {}
+        : {
+            shouldRunUnattendedWork:
+              typeof input.hostAllowsWork === "boolean"
+                ? Effect.succeed(input.hostAllowsWork)
+                : input.hostAllowsWork,
+          }),
       ...(input.awaitServerReady ? { awaitServerReady: input.awaitServerReady } : {}),
       resolveAttachmentPath: () => null,
       credentials: () => Effect.die("unused"),
@@ -376,6 +388,386 @@ describe("makeManagedServerProvider", () => {
     ),
   );
 
+  it.effect.each([
+    { name: "a short interval", hostAllowsWork: true, interval: 1_000, jitter: 100 },
+    { name: "a long interval", hostAllowsWork: true, interval: 600_000, jitter: 30_000 },
+    { name: "a paused host", hostAllowsWork: false, interval: 1_000, jitter: 100 },
+    { name: "a disabled interval", hostAllowsWork: true, interval: 0, jitter: 0 },
+  ])("schedules unattended checks with $name", ({ hostAllowsWork, interval, jitter }) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const checkCalls = yield* Ref.make(0);
+        const initialCheckDone = yield* Deferred.make<void>();
+        const scheduledCheckDone = yield* Deferred.make<void>();
+        const ready = yield* Deferred.make<void>();
+        const provider = yield* makeManagedServerProvider<TestSettings>({
+          resolveMaintenance: () => Effect.succeed(maintenanceCapabilities),
+          getSettings: Effect.succeed({ enabled: true }),
+          streamSettings: Stream.empty,
+          haveSettingsChanged: (previous, next) => previous.enabled !== next.enabled,
+          unattendedRefreshInterval: (_, intervalMs) =>
+            Effect.succeed({ intervalMs, jitter: true }),
+          initialSnapshot: () => Effect.succeed(initialSnapshot),
+          checkProvider: Ref.updateAndGet(checkCalls, (count) => count + 1).pipe(
+            Effect.tap((count) =>
+              Deferred.succeed(count === 1 ? initialCheckDone : scheduledCheckDone, undefined),
+            ),
+            Effect.as(refreshedSnapshot),
+          ),
+          refreshInterval: `${interval} millis`,
+        }).pipe(
+          Effect.provide(
+            layerProviderHost({
+              runBackgroundWork: false,
+              hostAllowsWork,
+              awaitServerReady: Deferred.await(ready),
+            }),
+          ),
+        );
+
+        const initialPublished = yield* provider.streamChanges.pipe(
+          Stream.runHead,
+          Effect.forkChild({ startImmediately: true }),
+        );
+        yield* Deferred.succeed(ready, undefined);
+        yield* Deferred.await(initialCheckDone);
+        yield* Fiber.join(initialPublished);
+        yield* TestClock.adjust("0 millis");
+        if (interval > 0 && hostAllowsWork) {
+          yield* TestClock.adjust(`${interval + jitter - 1} millis`);
+          assert.strictEqual(yield* Ref.get(checkCalls), 1);
+          yield* TestClock.adjust("1 millis");
+          yield* Deferred.await(scheduledCheckDone);
+          assert.strictEqual(yield* Ref.get(checkCalls), 2);
+        } else {
+          yield* TestClock.adjust("2 minutes");
+          assert.strictEqual(yield* Ref.get(checkCalls), 1);
+        }
+      }),
+    ).pipe(
+      Effect.provideService(Random.Random, {
+        nextDoubleUnsafe: () => 1 - Number.EPSILON,
+        nextIntUnsafe: () => 0,
+      }),
+      Effect.provide(TestClock.layer()),
+    ),
+  );
+
+  it.effect.each(["disabled interval", "host pause", "ineligible snapshot"] as const)(
+    "rechecks a queued unattended refresh after a change to $0",
+    (change) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const checkStarted = yield* Deferred.make<void>();
+          const releaseCheck = yield* Deferred.make<void>();
+          const checkedPower = yield* Deferred.make<void>();
+          const checkCalls = yield* Ref.make(0);
+          const interval = yield* Ref.make(Duration.seconds(1));
+          const hostAllowsWork = yield* Ref.make(true);
+          const eligible = yield* Ref.make(true);
+          const get = Ref.get(interval).pipe(
+            Effect.map((providerHealthRefreshInterval) => ({
+              ...DEFAULT_SERVER_SETTINGS,
+              backgroundActivity: {
+                schemaVersion: 1 as const,
+                profile: "custom" as const,
+                overrides: { providerHealthRefreshInterval },
+              },
+            })),
+          );
+          const layer = layerProviderHost({
+            runBackgroundWork: false,
+            hostAllowsWork: Ref.get(hostAllowsWork).pipe(
+              Effect.tap(() => Deferred.succeed(checkedPower, undefined)),
+            ),
+            settings: {
+              get,
+              withSnapshot: (use) => Effect.flatMap(get, use),
+              changes: Stream.empty,
+              subscribe: Effect.succeed(Stream.empty),
+            },
+          });
+          yield* makeManagedServerProvider<TestSettings>({
+            resolveMaintenance: () => Effect.succeed(maintenanceCapabilities),
+            getSettings: Effect.succeed({ enabled: true }),
+            streamSettings: Stream.empty,
+            haveSettingsChanged: (previous, next) => previous.enabled !== next.enabled,
+            unattendedRefreshInterval: (_, intervalMs) =>
+              Ref.get(eligible).pipe(
+                Effect.map((allowed) => (allowed ? { intervalMs, jitter: true } : undefined)),
+              ),
+            initialSnapshot: () => Effect.succeed(initialSnapshot),
+            checkProvider: Ref.updateAndGet(checkCalls, (count) => count + 1).pipe(
+              Effect.tap((count) =>
+                count === 1
+                  ? Deferred.succeed(checkStarted, undefined).pipe(
+                      Effect.andThen(Deferred.await(releaseCheck)),
+                    )
+                  : Effect.void,
+              ),
+              Effect.as(refreshedSnapshot),
+            ),
+          }).pipe(Effect.provide(layer));
+
+          yield* Deferred.await(checkStarted);
+          yield* TestClock.adjust("1100 millis");
+          yield* Deferred.await(checkedPower);
+          if (change === "disabled interval") yield* Ref.set(interval, Duration.zero);
+          if (change === "host pause") yield* Ref.set(hostAllowsWork, false);
+          if (change === "ineligible snapshot") yield* Ref.set(eligible, false);
+          yield* Deferred.succeed(releaseCheck, undefined);
+          yield* TestClock.adjust("0 millis");
+          assert.strictEqual(yield* Ref.get(checkCalls), 1);
+        }),
+      ).pipe(Effect.provide(TestClock.layer())),
+  );
+
+  it.effect.each([
+    {
+      name: "after an unattended failure",
+      unattendedMs: 60_000,
+      clientMs: 120_000,
+      failAt: 60,
+      probeMs: 5_000,
+    },
+    {
+      name: "after a client check fails",
+      unattendedMs: 80_000,
+      clientMs: 60_000,
+      failAt: 60,
+      probeMs: 0,
+    },
+    {
+      name: "when the unattended timer reaches the retry while the client is waiting",
+      unattendedMs: 60_000,
+      clientMs: 120_000,
+      failAt: 60,
+      probeMs: 5_000,
+      unattendedConfirms: true,
+    },
+    {
+      name: "when an unattended tick queues before a client check fails",
+      unattendedMs: 65_000,
+      clientMs: 60_000,
+      failAt: 60,
+      probeMs: 10_000,
+      queuedUnattended: true,
+    },
+    {
+      name: "when a client tick queued before the failure would run during teardown",
+      detachedTeardown: true,
+      unattendedMs: 120_000,
+      clientMs: 125_000,
+      failAt: 120,
+      probeMs: 10_000,
+    },
+    {
+      name: "unless a newer manual check publishes first",
+      unattendedMs: 60_000,
+      clientMs: 120_000,
+      failAt: 60,
+      probeMs: 5_000,
+      manual: true,
+    },
+  ])(
+    "honors the 60-second recheck $name",
+    ({
+      unattendedMs,
+      clientMs,
+      failAt,
+      probeMs,
+      manual,
+      detachedTeardown,
+      queuedUnattended,
+      unattendedConfirms,
+    }) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const checkCalls = yield* Ref.make(0);
+          const published = yield* Ref.make<ReadonlyArray<ServerProvider>>([]);
+          const ready = yield* Deferred.make<void>();
+          const unattendedQueued = yield* Deferred.make<void>();
+          const failed: ServerProvider = {
+            ...refreshedSnapshot,
+            status: "error",
+            checkedAt: "2026-04-10T00:00:02.000Z",
+            message: "The check failed once.",
+          };
+          const retrySnapshot = unattendedConfirms ? failed : refreshedSnapshotSecond;
+          const provider = yield* makeManagedServerProvider<TestSettings>({
+            resolveMaintenance: () => Effect.succeed(maintenanceCapabilities),
+            getSettings: Effect.succeed({ enabled: true }),
+            streamSettings: Stream.empty,
+            haveSettingsChanged: (previous, next) => previous.enabled !== next.enabled,
+            unattendedRefreshInterval: () =>
+              Effect.succeed({ intervalMs: unattendedMs, jitter: false }),
+            ...(unattendedConfirms ? { waitForPreviousCheck: Effect.never } : {}),
+            initialSnapshot: () => Effect.succeed(initialSnapshot),
+            checkProvider: Ref.updateAndGet(checkCalls, (count) => count + 1).pipe(
+              Effect.flatMap((count) =>
+                count === 1
+                  ? Effect.succeed(refreshedSnapshot)
+                  : count === 2
+                    ? Effect.sleep(Duration.millis(probeMs)).pipe(Effect.as(failed))
+                    : Clock.currentTimeMillis.pipe(
+                        Effect.map((now) =>
+                          detachedTeardown && now < failAt * 1_000 + probeMs + 10_000
+                            ? undefined
+                            : retrySnapshot,
+                        ),
+                      ),
+              ),
+            ),
+            refreshInterval: Duration.millis(clientMs),
+          }).pipe(
+            Effect.provide(
+              layerProviderHost({
+                runBackgroundWork: true,
+                awaitServerReady: Deferred.await(ready),
+                hostAllowsWork: Clock.currentTimeMillis.pipe(
+                  Effect.tap((now) =>
+                    now === unattendedMs
+                      ? Deferred.succeed(unattendedQueued, undefined)
+                      : Effect.void,
+                  ),
+                  Effect.as(true),
+                ),
+              }),
+            ),
+          );
+          yield* Stream.runForEach(provider.streamChanges, (snapshot) =>
+            Ref.update(published, (snapshots) => [...snapshots, snapshot]),
+          ).pipe(Effect.forkChild({ startImmediately: true }));
+          yield* Deferred.succeed(ready, undefined);
+          yield* TestClock.adjust("0 millis");
+          assert.strictEqual(yield* Ref.get(checkCalls), 1);
+
+          // The first failure stays hidden until the retry can confirm it.
+          if (queuedUnattended) {
+            yield* TestClock.adjust("60 seconds");
+            assert.strictEqual(yield* Ref.get(checkCalls), 2);
+            yield* TestClock.adjust("5 seconds");
+            yield* Deferred.await(unattendedQueued);
+            yield* TestClock.adjust("5 seconds");
+          } else {
+            yield* TestClock.adjust(Duration.millis(failAt * 1_000 + probeMs));
+          }
+          assert.strictEqual(yield* Ref.get(checkCalls), 2);
+          if (manual) {
+            yield* TestClock.adjust("15 seconds");
+            yield* provider.refresh;
+            yield* TestClock.adjust("45 seconds");
+          } else {
+            yield* TestClock.adjust("59999 millis");
+            assert.strictEqual(yield* Ref.get(checkCalls), 2);
+            yield* TestClock.adjust("1 millis");
+          }
+          assert.strictEqual(yield* Ref.get(checkCalls), 3);
+          const statuses = (yield* Ref.get(published)).map((snapshot) => snapshot.status);
+          assert.deepStrictEqual(
+            statuses.filter((status) => status === "error"),
+            unattendedConfirms ? ["error"] : [],
+          );
+          assert.strictEqual((yield* provider.getSnapshot).checkedAt, retrySnapshot.checkedAt);
+        }),
+      ).pipe(Effect.provide(TestClock.layer())),
+  );
+
+  it.effect(
+    "floors the client interval after a slow first check and skips a cycle after a refresh",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const checkCalls = yield* Ref.make(0);
+          const provider = yield* makeManagedServerProvider<TestSettings>({
+            resolveMaintenance: () => Effect.succeed(maintenanceCapabilities),
+            getSettings: Effect.succeed({ enabled: true }),
+            streamSettings: Stream.empty,
+            haveSettingsChanged: (previous, next) => previous.enabled !== next.enabled,
+            unattendedRefreshInterval: () => Effect.succeed({ intervalMs: 600_000, jitter: false }),
+            initialSnapshot: () => Effect.succeed(initialSnapshot),
+            checkProvider: Ref.updateAndGet(checkCalls, (count) => count + 1).pipe(
+              Effect.flatMap((count) =>
+                count === 1
+                  ? Effect.sleep("5 seconds").pipe(Effect.as(refreshedSnapshot))
+                  : Effect.succeed(refreshedSnapshotSecond),
+              ),
+            ),
+            refreshInterval: "30 seconds",
+          }).pipe(Effect.provide(layerProviderHost({ runBackgroundWork: true })));
+
+          yield* TestClock.adjust("30 seconds");
+          assert.strictEqual(yield* Ref.get(checkCalls), 1);
+          yield* TestClock.adjust("30 seconds");
+          assert.strictEqual(yield* Ref.get(checkCalls), 2);
+          yield* TestClock.adjust("30 seconds");
+          assert.strictEqual(yield* Ref.get(checkCalls), 2);
+          yield* provider.refresh;
+          assert.strictEqual(yield* Ref.get(checkCalls), 3);
+          yield* TestClock.adjust("30 seconds");
+          assert.strictEqual(yield* Ref.get(checkCalls), 3);
+          yield* TestClock.adjust("60 seconds");
+          assert.strictEqual(yield* Ref.get(checkCalls), 4);
+        }),
+      ).pipe(Effect.provide(TestClock.layer())),
+  );
+
+  it.effect.each([
+    { name: "drops", probeOnlyUsage: true },
+    { name: "keeps", probeOnlyUsage: false },
+  ])("$name earlier limits after a signed-out check with probe-only usage", ({ probeOnlyUsage }) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const usage = {
+          checkedAt: "2026-04-10T00:00:01.000Z",
+          windows: [{ id: "primary", kind: "session", label: "Session", usedPercent: 10 }],
+        } as const;
+        const signedOutUsage = {
+          checkedAt: "2026-04-10T00:00:05.000Z",
+          windows: [],
+          unavailable: { reason: "probeFailed", message: "The service refused this login." },
+        } as const;
+        const signedIn = yield* Ref.make(true);
+        const provider = yield* makeManagedServerProvider<TestSettings>({
+          resolveMaintenance: () => Effect.succeed(maintenanceCapabilities),
+          getSettings: Effect.succeed({ enabled: true }),
+          streamSettings: Stream.empty,
+          haveSettingsChanged: (previous, next) => previous.enabled !== next.enabled,
+          initialSnapshot: () => Effect.succeed(initialSnapshot),
+          probeOnlyUsage,
+          checkProvider: Ref.get(signedIn).pipe(
+            Effect.map((authenticated) =>
+              authenticated
+                ? { ...refreshedSnapshot, usageLimits: usage }
+                : {
+                    ...refreshedSnapshot,
+                    status: "error" as const,
+                    auth: { status: "unauthenticated" as const },
+                    usageLimits: signedOutUsage,
+                  },
+            ),
+          ),
+        });
+
+        assert.deepStrictEqual((yield* provider.refresh).usageLimits, usage);
+        yield* Ref.set(signedIn, false);
+        assert.deepStrictEqual(
+          (yield* provider.refresh).usageLimits,
+          probeOnlyUsage ? signedOutUsage : usage,
+        );
+        // A turn update does not bring limits back while the login is signed out.
+        yield* provider.applyUsageLimits({
+          checkedAt: "2026-04-10T00:00:06.000Z",
+          complete: true,
+          windows: [{ id: "primary", kind: "session", label: "Session", usedPercent: 3 }],
+        });
+        const afterTurn = (yield* provider.getSnapshot).usageLimits;
+        if (probeOnlyUsage) assert.deepStrictEqual(afterTurn, signedOutUsage);
+        else assert.strictEqual(afterTurn?.windows[0]?.usedPercent, 3);
+      }),
+    ).pipe(Effect.provide(Layer.mergeAll(layerAlwaysRunTest, TestClock.layer()))),
+  );
+
   it.effect("stops periodic recovery checks once the snapshot is ready", () =>
     Effect.scoped(
       Effect.gen(function* () {
@@ -450,8 +842,11 @@ describe("makeManagedServerProvider", () => {
         yield* Effect.yieldNow;
 
         yield* TestClock.adjust("5 minutes");
-        yield* TestClock.adjust("1 minute");
+        yield* TestClock.adjust("29999 millis");
+        assert.strictEqual(yield* Ref.get(checkCalls), 2);
+        yield* TestClock.adjust("1 millis");
 
+        assert.strictEqual(yield* Ref.get(checkCalls), 3);
         assert.strictEqual((yield* provider.getSnapshot).status, "ready");
         assert.deepStrictEqual(
           (yield* Ref.get(published)).filter((snapshot) => snapshot.status === "error"),
@@ -1029,5 +1424,83 @@ describe("makeManagedServerProvider", () => {
         assert.deepStrictEqual((yield* provider.refresh).usageLimits, completeLimits);
       }),
     ).pipe(Effect.provide(layerAlwaysRunTest)),
+  );
+
+  it.effect.each([
+    { name: "no jitter", double: 0 },
+    { name: "half jitter", double: 0.5 },
+  ])(
+    "unattended refresh resumes after a deferred failure once the client leaves ($name)",
+    ({ double }) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const checkCalls = yield* Ref.make(0);
+          const clientConnected = yield* Ref.make(true);
+          const failed: ServerProvider = {
+            ...refreshedSnapshot,
+            status: "error",
+            checkedAt: "2026-04-10T00:00:02.000Z",
+            message: "The check failed once.",
+          };
+          const host = Layer.succeed(
+            ProviderHost.ProviderHost,
+            ProviderHost.ProviderHost.of({
+              compatibility: () => Effect.undefined,
+              paths: {
+                cwd: process.cwd(),
+                baseDir: "/t3",
+                stateDir: "/t3/userdata",
+                providerStatusCacheDir: "/t3/caches",
+                attachmentsDir: "/t3/userdata/attachments",
+              },
+              settings: {
+                get: Effect.succeed(DEFAULT_SERVER_SETTINGS),
+                withSnapshot: (use) => use(DEFAULT_SERVER_SETTINGS),
+                changes: Stream.empty,
+                subscribe: Effect.succeed(Stream.empty),
+              },
+              shouldRunBackgroundWork: () => Ref.get(clientConnected),
+              shouldRunUnattendedWork: Effect.succeed(true),
+              resolveAttachmentPath: () => null,
+              credentials: () => Effect.die("unused"),
+            }),
+          );
+          yield* makeManagedServerProvider<TestSettings>({
+            resolveMaintenance: () => Effect.succeed(maintenanceCapabilities),
+            getSettings: Effect.succeed({ enabled: true }),
+            streamSettings: Stream.empty,
+            haveSettingsChanged: (previous, next) => previous.enabled !== next.enabled,
+            unattendedRefreshInterval: (_, intervalMs) =>
+              Effect.succeed({ intervalMs, jitter: true }),
+            initialSnapshot: () => Effect.succeed(initialSnapshot),
+            checkProvider: Ref.updateAndGet(checkCalls, (count) => count + 1).pipe(
+              Effect.map((count) =>
+                count === 2
+                  ? failed
+                  : {
+                      ...refreshedSnapshotSecond,
+                      checkedAt: `2026-04-10T01:00:${String(count).padStart(2, "0")}.000Z`,
+                    },
+              ),
+            ),
+            refreshInterval: "300 seconds",
+          }).pipe(Effect.provide(host));
+          yield* TestClock.adjust("0 millis");
+          assert.strictEqual(yield* Ref.get(checkCalls), 1);
+          for (let i = 0; i < 300; i++) yield* TestClock.adjust("1 second");
+          yield* TestClock.adjust("1 second");
+          assert.strictEqual(yield* Ref.get(checkCalls), 2);
+          yield* Ref.set(clientConnected, false);
+          for (let i = 0; i < 3600; i++) yield* TestClock.adjust("1 second");
+          // An hour without a client: the unattended timer should have checked several times.
+          assert.isAbove(yield* Ref.get(checkCalls), 2);
+        }),
+      ).pipe(
+        Effect.provideService(Random.Random, {
+          nextDoubleUnsafe: () => double,
+          nextIntUnsafe: () => 0,
+        }),
+        Effect.provide(TestClock.layer()),
+      ),
   );
 });

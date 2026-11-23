@@ -155,6 +155,7 @@ describe("BackgroundPolicy", () => {
       assert.equal(snapshot.activeForegroundLeaseCount, 1);
       assert.equal(snapshot.shouldRunOpportunisticWork, false);
       assert.equal(yield* policy.shouldRunScopeWork({ type: "vcs-status", cwd: "/repo" }), false);
+      assert.equal(yield* policy.shouldRunUnattendedWork, false);
     }).pipe(
       Effect.provide(
         layerFor({
@@ -179,6 +180,8 @@ describe("BackgroundPolicy", () => {
       assert.equal(snapshot.activeForegroundLeaseCount, 0);
       assert.deepStrictEqual(snapshot.activeScopeKeys, ["vcs-status:/repo"]);
       assert.equal(yield* policy.shouldRunScopeWork({ type: "vcs-status", cwd: "/repo" }), false);
+      // Unattended work runs without a foreground client.
+      assert.equal(yield* policy.shouldRunUnattendedWork, true);
     }).pipe(Effect.provide(layerFor(nominalHostPower))),
   );
 
@@ -208,6 +211,7 @@ describe("BackgroundPolicy", () => {
       );
 
       assert.equal(yield* policy.shouldRunScopeWork({ type: "vcs-status", cwd: "/repo" }), false);
+      assert.equal(yield* policy.shouldRunUnattendedWork, false);
     }).pipe(
       Effect.provide(
         layerFor(
@@ -220,6 +224,25 @@ describe("BackgroundPolicy", () => {
         ),
       ),
     ),
+  );
+
+  it.effect("keeps unattended work running on a locked screen", () =>
+    Effect.gen(function* () {
+      const policy = yield* BackgroundPolicy.BackgroundPolicy;
+      assert.equal(yield* policy.shouldRunScopeWork({ type: "vcs-status", cwd: "/repo" }), false);
+      assert.equal(yield* policy.shouldRunUnattendedWork, true);
+    }).pipe(Effect.provide(layerFor({ ...nominalHostPower, locked: "true", stale: false }))),
+  );
+
+  it.effect.each([
+    { pause: "thermal pressure", hostPower: { thermalState: "serious" } },
+    { pause: "suspension", hostPower: { suspended: true } },
+    { pause: "low power mode", hostPower: { lowPowerMode: "true" } },
+  ] as const)("pauses unattended work during $pause", ({ hostPower }) =>
+    Effect.gen(function* () {
+      const policy = yield* BackgroundPolicy.BackgroundPolicy;
+      assert.equal(yield* policy.shouldRunUnattendedWork, false);
+    }).pipe(Effect.provide(layerFor({ ...nominalHostPower, ...hostPower, stale: false }))),
   );
 
   it.effect("does not gate work on stale host power values", () =>

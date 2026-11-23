@@ -39,6 +39,8 @@ export class ProviderInstanceRegistry extends Context.Service<
     ) => Effect.Effect<ProviderInstance | undefined>;
     readonly listInstances: Effect.Effect<ReadonlyArray<ProviderInstance>>;
     readonly listUnavailable: Effect.Effect<ReadonlyArray<ServerProvider>>;
+    /** Ids whose retired instance is gone while its replacement is still being built. */
+    readonly listReplacing?: Effect.Effect<ReadonlySet<ProviderInstanceId>>;
     /** streamChanges subscribes on consumption; use subscribeChanges before forking to avoid missing the next publish. */
     readonly streamChanges: Stream.Stream<void>;
     readonly subscribeChanges: Effect.Effect<PubSub.Subscription<void>, never, Scope.Scope>;
@@ -64,6 +66,7 @@ interface RegistryState {
   // Configs parked on an unreadable secret. A settings save that leaves one alone does not read
   // its vault again, so a locked vault is not prompted for on every unrelated save.
   readonly secretsUnreadable: Ref.Ref<ReadonlyMap<ProviderInstanceId, ProviderInstanceConfig>>;
+  readonly replacing: Ref.Ref<ReadonlySet<ProviderInstanceId>>;
   readonly changes: PubSub.PubSub<void>;
 }
 
@@ -449,6 +452,8 @@ const makeReconcile = <R>(input: {
       if (retiredIds.length > 0) {
         const remaining = new Map(previousEntries);
         for (const id of retiredIds) remaining.delete(id);
+        // Set first: a reader that sees the id missing from entries must also see it here.
+        yield* Ref.set(state.replacing, replacedIds);
         yield* Ref.set(state.entries, remaining);
       }
       for (const id of retiredIds) {
@@ -562,7 +567,7 @@ const makeReconcile = <R>(input: {
       if (entriesChanged || unavailableChanged) {
         yield* PubSub.publish(state.changes, undefined);
       }
-    });
+    }).pipe(Effect.ensuring(Ref.set(state.replacing, new Set())));
 };
 
 export const makeProviderInstanceRegistry = Effect.fn(
@@ -597,10 +602,11 @@ export const makeProviderInstanceRegistry = Effect.fn(
   const secretsUnreadable = yield* Ref.make<
     ReadonlyMap<ProviderInstanceId, ProviderInstanceConfig>
   >(new Map());
+  const replacing = yield* Ref.make<ReadonlySet<ProviderInstanceId>>(new Set());
   const changes = yield* PubSub.unbounded<void>();
   yield* Effect.addFinalizer(() => PubSub.shutdown(changes));
 
-  const state: RegistryState = { entries, unavailable, secretsUnreadable, changes };
+  const state: RegistryState = { entries, unavailable, secretsUnreadable, replacing, changes };
   const reconcileWithR = makeReconcile({
     state,
     driversById,
@@ -748,6 +754,7 @@ export const makeProviderInstanceRegistry = Effect.fn(
     listUnavailable: Ref.get(unavailable).pipe(
       Effect.map((map) => Array.from(map.values()) as ReadonlyArray<ServerProvider>),
     ),
+    listReplacing: Ref.get(replacing),
     get streamChanges() {
       return Stream.fromPubSub(changes);
     },
